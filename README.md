@@ -1,265 +1,65 @@
-# 🌌 Nebula Optimizer 🚀
+# Nebula Optimizer
 
-> ### ⚡ Competitive Gaming Performance Suite
->
-> **Aggressive Windows optimization for maximum FPS, minimum latency, and elite competitive performance.**
+A lightweight Windows game optimizer with automatic attach and session restore.
 
----
+## Use
 
-## 🪐 Overview
+1. Run `Nebula-Optimizer.exe` and approve the Windows UAC prompt.
+   On startup, Nebula closes older instances from the same directory and restores their session before starting a new one.
+2. Create or select a profile. Nebula checks the active profile every 2.5 seconds and attaches when the actual game process starts. It restores temporary settings when the game exits.
+3. Press `1` to launch the selected game yourself, `2` to manage profiles, or `3` for Windows-only optimization. During a session, the tweak carousel is open by default: hover over a category or press Left/Right to switch immediately, use Up/Down or `J/K` to select a tweak, and press Enter to toggle it. The `Saved` tab lists durable settings; `S` saves or unsaves the selected setting, and `R` deliberately reapplies a saved setting marked `Drift`. `P` remains the capture shortcut. Press Esc to collapse the carousel or `L` to show it again. Press `M` to hide to the notification area or `0` to stop and restore.
+4. Optional: place the official `PresentMon.exe` next to Nebula (or on `PATH`) and press `P` during a game for a 10-second input-to-display capture. This is not an edit-to-action measurement. No capture runs in the background by default.
 
-**Nebula Optimizer** is a high-performance Windows gaming optimizer engineered for competitive players seeking:
+Fortnite launches through its official Epic desktop shortcut. Nebula targets `FortniteClient-Win64-Shipping.exe`, not its anti-cheat or launcher.
 
-* 🎯 Lower input latency
-* 🖥️ Reduced system overhead
-* 📈 Higher FPS stability
-* 🔥 Fortnite-specific tuning
-* 🧹 Advanced background cleanup
-* ⚙️ Automatic restore systems
-* 🌠 Terminal-based futuristic interface
+Registry values, power plan, and changed process priorities are journaled at `%LOCALAPPDATA%\NebulaOptimizer\session-journal.json`. Nebula recovers them after an unexpected exit. A successful restore triggers one notification.
 
-Nebula transforms Windows into a streamlined gaming machine before launch.
+Tweak choices are saved at `%LOCALAPPDATA%\NebulaOptimizer\tweaks.json`. During an active game, a change restores and reapplies the session; while waiting for Fortnite to start, the change takes effect next session. Optional Game Bar shortcut tweaks start off because they can interfere with recording controls.
 
----
+Nebula scans durable settings without changing Windows after session recovery.
+`baseline.json` keeps the first, first available, and latest raw observations;
+`Base` means the first available observation already matched Nebula's target, while `Unknown` means it
+could not be established. `saved.json` stores retained settings (automatic `Base`
+imports and manual choices),
+and `saved-operation.json` is a separate crash-recovery transaction. A yellow
+`*` marks `Saved`; unpinning leaves the Windows value as-is. `Drift` means a
+saved value changed outside Nebula: it is not silently reapplied, even when a
+session starts. The normal session still restores its own pre-session values,
+not the baseline scan. Process priorities, sleep prevention and the temporary
+power-plan clone cannot be saved. Saving a power setting changes the base plan
+identified by its GUID; GPU preference is tied to the exact game executable.
+Display saving requires a 15-second visual confirmation, and experimental,
+diagnostic or accessibility settings require an additional confirmation.
+At startup, a read-only scan automatically adds already-matching durable `Base`
+settings to `Saved`; it does not apply anything to Windows. `[S] Scan PC` on the
+home screen repeats the scan. If you unpin a setting, Nebula records that choice
+in `saved-dismissed.json` and will not import it again automatically. A later
+manual `S` can save it again.
 
-# ✨ Core Features
+The 41 session controls are grouped into five categories plus the `Saved` tab. The extra controls
+cover experimental core parking, AC Wi-Fi performance, and diagnostic USB
+selective suspend, plus optional accessibility hotkeys. Core parking, USB
+diagnostics, and accessibility hotkeys default off. Power settings
+are applied to a temporary copy of the active plan, which is deleted after the
+session. The session view shows color-coded `Applied`, `Skipped`, and `Failed`
+counts. `Applied` includes settings already at the target value; it does not
+imply a measured performance gain. `Off` and `Drift` remain separate and are
+not counted. The left-aligned layout is preserved, while live metrics update
+without clearing the whole frame each time. Every changed value is journaled
+for restoration. On startup, Nebula retires older instances
+from its own directory, then recovers their session before allowing a new one.
+If recovery is incomplete, close the game and press `R` to retry.
 
-## 👤 Profile Management
+The attached optimization plan is only partially implemented. See
+[docs/PLAN_IMPLEMENTATION.md](docs/PLAN_IMPLEMENTATION.md) for the exact status
+of each requested feature and the remaining safety limitations.
 
-* ➕ Create custom game profiles
-* 📂 Save executable paths in JSON
-* 🚀 Instant profile loading
-* 🎮 Game-specific dashboard
-* 🛰️ Fast configuration switching
+## Build
 
----
+Requires Windows, MSYS2/MinGW, `g++`, `windres`, and `mingw32-make`.
 
-## ⚔️ System Optimization Engine
-
-Nebula aggressively optimizes your system by:
-
-### 🧨 Process Elimination
-
-* ❌ explorer.exe
-* ❌ OneDrive.exe
-* ❌ Xbox services
-* ❌ GameBar
-* ❌ SearchHost
-* ❌ Widgets
-* ❌ Steam/Epic web helpers
-* ❌ Background resource drains
-
----
-
-### 🧬 Performance Tweaks
-
-* ⚡ High performance power plans
-* 🧠 Memory optimization
-* 🌐 DNS cache flush
-* 🗑️ Temp file purge
-* 📉 UI animation disable
-* 🛡️ Game DVR disable
-* 📡 Network throttling reduction
-* 🎯 Scheduler/game priority tuning
-
----
-
-## 🏆 Fortnite Specialized Mode
-
-When Fortnite is detected:
-
-* 🛠️ Epic launcher optimization
-* 🚫 Full Game DVR disable
-* 🌐 Network stack tuning
-* 🎮 Multimedia scheduler boosts
-* 📈 Registry performance enhancements
-* 🔥 Dedicated competitive optimization preset
-
----
-
-## 🔄 Restore Mode
-
-Nebula safely restores:
-
-* 🖥️ Explorer shell
-* ☁️ OneDrive
-* 🧩 Windows services
-* 🎮 Game DVR settings
-* ⚙️ Default usability environment
-
----
-
-# 🗂️ Project Architecture
-
-```bash
-🌌 Nebula Optimizer/
-│
-├── ⚙️ config/
-│   └── profiles/
-│       └── *.json
-│
-├── 📚 includes/
-│   ├── json/
-│   ├── optimizer/
-│   └── ui/
-│
-├── 💻 src/
-│   ├── core/
-│   ├── json/
-│   ├── optimizer/
-│   └── ui/
-│
-├── 📦 obj/
-├── 🛠️ Makefile
-└── 🚀 main.cpp
-```
-
----
-
-# 🛠️ Build Instructions
-
-## 📋 Requirements
-
-* 🪟 Windows
-* ⚙️ MinGW g++
-* 🧠 C++17
-* 🔑 Administrator privileges
-
----
-
-## 🔨 Compile
-
-```bash
+```powershell
 mingw32-make
 ```
 
-## ♻️ Full Rebuild
-
-```bash
-mingw32-make re
-```
-
-## 🧹 Clean Build Files
-
-```bash
-mingw32-make clean
-```
-
----
-
-# 🚀 Usage
-
-## ▶️ Launch Nebula
-
-```bash
-./nebula_optimizer.exe
-```
-
----
-
-## 🌠 Workflow
-
-### 1️⃣ Add New Profile
-
-### 2️⃣ Select Game Executable
-
-### 3️⃣ Save Profile
-
-### 4️⃣ Load Profile
-
-### 5️⃣ Launch with Optimization
-
----
-
-# 📄 Profile Configuration Example
-
-```json
-{
-  "profile_name": "fortnite",
-  "game_path": "C:/Path/To/Game.exe"
-}
-```
-
-📍 Stored in:
-
-```bash
-config/profiles/
-```
-
----
-
-# ⚠️ Security Notice
-
-Nebula performs advanced system-level modifications:
-
-* 🔪 Process termination
-* 🛠️ Registry edits
-* ⛔ Service suspension
-* ⚡ Boot config tuning
-* 🧹 Cache cleaning
-
-## 🛡️ Recommendation:
-
-### Always run as Administrator.
-
----
-
-# 🎯 Target Audience
-
-Perfect for:
-
-* 🏆 Competitive gamers
-* 🎮 Fortnite players
-* ⚡ Low latency enthusiasts
-* 🧼 Windows debloat users
-* 📈 FPS optimization experts
-
----
-
-# 🌌 Future Roadmap
-
-## 🔮 Planned Features
-
-* 🖼️ GUI Interface
-* 🔍 Auto game detection
-* 🚂 Steam/Epic native launcher integration
-* 💾 Config backup systems
-* 🎚️ Optimization presets
-* 📊 Benchmark dashboards
-* 🧠 AI-based optimization recommendations
-
----
-
-# 📜 Disclaimer
-
-Nebula Optimizer is designed exclusively for:
-
-## 🎯 Performance enhancement
-
-## ⚙️ Competitive gaming optimization
-
-Aggressive optimizations may temporarily impact:
-
-* Normal desktop usability
-* Background services
-* Convenience features
-
-### 🧪 Always test responsibly.
-
----
-
-# 👨‍💻 Author
-
-### Built for scalable gaming optimization, elite performance workflows, and competitive dominance.
-
----
-
-# 📄 License
-
-## MIT License
-
----
-
-# 🌠 Nebula Mission
-
-> **"Strip away the unnecessary. Maximize pure performance."** 🚀
+See [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) for tweak rationale and limitations. No specific FPS or input-latency gain is guaranteed.

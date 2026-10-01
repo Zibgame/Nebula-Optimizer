@@ -10,3 +10,4 @@ using json = nlohmann::json;
 bool	create_profile(const std::string &profile_name, const std::string &game_path);
 bool	delete_profile(const std::string &profile_name);
 std::vector<std::string>	get_profiles_list();
+std::string	load_profile_game_path(const std::string &profile_name);
