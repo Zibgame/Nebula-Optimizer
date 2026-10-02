@@ -7,7 +7,7 @@ int main()
 {
     using Status=Optimizer::TweakStatus;
     auto item=[](Status status) {
-        return Optimizer::TweakSetting{"Test","CPU & Power",true,status,{}};
+        return Optimizer::TweakSetting{"Test","CPU & Power",true,status,{},"",false};
     };
     std::vector<Optimizer::TweakSetting> settings={
         item(Status::Applied),item(Status::AlreadyConfigured),
@@ -36,7 +36,7 @@ int main()
          std::vector<size_t>{1} &&
          changed_frame_rows({"one"},{"one"}).empty() && okay;
     std::vector<Optimizer::TweakSetting> impact_settings(60,
-        {"Test", "CPU & Power", true, Status::Skipped, {}});
+        {"Test", "CPU & Power", true, Status::Skipped, {}, "", false});
     ClosedAppsSummary apps{};
     apps.closed = 1;
     apps.closed_working_set_bytes = 150 * 1024 * 1024;

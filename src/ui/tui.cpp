@@ -38,7 +38,7 @@ constexpr const char* TWEAK_TABS[] = {
 constexpr size_t CLOSE_APPS_ROW = static_cast<size_t>(-1);
 
 enum class MenuKey { None, Up, Down, Left, Right, Select, Back };
-enum class SessionAction { Save, Reapply, Capture, Benchmark, Tray, Stop };
+enum class SessionAction { ApplyAll, Save, Reapply, Capture, Benchmark, Tray, Stop };
 
 void wait_for_menu_key(DWORD timeout)
 {
@@ -88,6 +88,7 @@ private:
 const char* action_label(SessionAction action, bool saved = false)
 {
     switch (action) {
+    case SessionAction::ApplyAll: return "Apply All";
     case SessionAction::Save: return saved ? "Unsave" : "Save";
     case SessionAction::Reapply: return "Reapply";
     case SessionAction::Capture: return "Capture";
@@ -266,7 +267,9 @@ void tweak_row(const Optimizer::TweakSetting& setting, bool selected)
                  {view_label(state),view_color(state)},
                  {"] ",BRIGHT_BLACK},
                  {setting.label,selected ? LIGHT_PURPLE :
-                    setting.enabled ? LIGHT_GREEN : BRIGHT_BLACK}});
+                    setting.enabled ? LIGHT_GREEN : BRIGHT_BLACK},
+                 {setting.adjustable ? "  <[" + setting.value + "]>" : "",
+                  setting.adjustable ? LIGHT_CYAN : BRIGHT_BLACK}});
 }
 
 std::vector<std::string> frame_lines(const std::string& frame)
@@ -1348,6 +1351,8 @@ void Tui::optimization_monitor_screen()
     SHORT carousel_y = 0;
     CarouselLayout carousel;
     std::string tweak_message;
+    bool value_reapply_pending = false;
+    ULONGLONG value_reapply_at = 0;
     ULONGLONG previous_idle = 0;
     ULONGLONG previous_total = 0;
     ULONGLONG previous_self = 0;
@@ -1355,6 +1360,17 @@ void Tui::optimization_monitor_screen()
     double nebula_percent = 0.0;
     std::vector<std::string> previous_frame;
     while (active) {
+        if (value_reapply_pending && GetTickCount64() >= value_reapply_at) {
+            value_reapply_pending = false;
+            _optimizer.restore();
+            if (!_optimizer.restoration_succeeded() ||
+                !_optimizer.optimize(_launch_path, false)) {
+                tweak_message = "Could not apply the new value";
+                active = false;
+            } else {
+                tweak_message = "Value applied";
+            }
+        }
         if (tray.stop_requested())
             break;
         if (tray.show_requested() && console_window) {
@@ -1577,7 +1593,10 @@ void Tui::optimization_monitor_screen()
             row(tweak_message, LIGHT_YELLOW);
         const bool app_action = expanded && !category_tweaks.empty() &&
             category_tweaks[selected_tweak] == CLOSE_APPS_ROW;
+        const bool selected_adjustable = expanded && !category_tweaks.empty() &&
+            !app_action && settings[category_tweaks[selected_tweak]].adjustable;
         std::vector<SessionAction> actions;
+        actions.push_back(SessionAction::ApplyAll);
         bool selected_saved = false;
         if (expanded && !category_tweaks.empty() && !app_action) {
             const auto& selected = settings[category_tweaks[selected_tweak]];
@@ -1599,7 +1618,9 @@ void Tui::optimization_monitor_screen()
             "J/K/H/L Action  Enter Select  Esc Tweaks" :
             !expanded ? "Enter Open tweaks  Tab Actions" :
             app_action ? "H/L Tabs  J/K Select  Enter Manage  Tab Actions  Esc Hide" :
-            "H/L Tabs  J/K Tweaks  Enter Toggle  Tab Actions  Esc Hide", WHITE);
+            selected_adjustable ?
+            "H/L Tabs  J/K Tweaks  Left/Right Value  Enter Toggle  Tab Actions" :
+            "H/L Tabs  J/K Tweaks  Left/Right Tabs  Enter Toggle  Tab Actions", WHITE);
         std::vector<std::pair<std::string,const char*>> action_parts = {
             {"ACTIONS  ", LIGHT_PURPLE}
         };
@@ -1687,6 +1708,7 @@ void Tui::optimization_monitor_screen()
                     }
                     if (key != 13) break;
                     switch (actions[action_cursor]) {
+                    case SessionAction::ApplyAll: key = 'a'; break;
                     case SessionAction::Save: key = 's'; break;
                     case SessionAction::Reapply: key = 'r'; break;
                     case SessionAction::Capture: key = 'p'; break;
@@ -1697,6 +1719,32 @@ void Tui::optimization_monitor_screen()
                 }
                 if (key == '0')
                     active = false;
+                else if (key == 'a' || key == 'A') {
+                    SetConsoleCursorInfo(console, &original_cursor);
+                    const bool confirmed = select_menu(
+                        "Apply all compatible tweaks?",
+                        {"Cancel", "Apply all"}) == 1;
+                    SetConsoleCursorInfo(console, &hidden_cursor);
+                    previous_frame.clear();
+                    if (!confirmed) {
+                        tweak_message = "Cancelled";
+                    } else if (!_optimizer.enable_all_tweaks()) {
+                        tweak_message = "Could not save tweak settings";
+                    } else if (_optimizer.is_waiting_for_game()) {
+                        tweak_message = "All tweaks enabled for the next session";
+                    } else {
+                        value_reapply_pending = false;
+                        _optimizer.restore();
+                        if (!_optimizer.restoration_succeeded() ||
+                            !_optimizer.optimize(_launch_path, false)) {
+                            tweak_message = "Could not reapply session";
+                            active = false;
+                        } else {
+                            tweak_message = "All compatible tweaks applied";
+                        }
+                    }
+                    break;
+                }
                 else if (!expanded && (key == 13 || key == 'l' || key == 'L')) {
                     expanded = true;
                     break;
@@ -1710,6 +1758,7 @@ void Tui::optimization_monitor_screen()
                                         key == 0 || key == 224)) {
                     int direction = 0;
                     int category_direction = 0;
+                    int value_direction = 0;
                     if (key == 'j' || key == 'J')
                         direction = 1;
                     else if (key == 'k' || key == 'K')
@@ -1721,10 +1770,25 @@ void Tui::optimization_monitor_screen()
                     else {
                         const int arrow = _getch();
                         direction = arrow == 80 ? 1 : (arrow == 72 ? -1 : 0);
-                        category_direction = arrow == 77 ? 1 :
-                                             (arrow == 75 ? -1 : 0);
+                        const int horizontal = arrow == 77 ? 1 :
+                                               (arrow == 75 ? -1 : 0);
+                        if (horizontal && selected_adjustable)
+                            value_direction = horizontal;
+                        else
+                            category_direction = horizontal;
                     }
-                    if (category_direction) {
+                    if (value_direction) {
+                        const size_t index = category_tweaks[selected_tweak];
+                        if (!_optimizer.adjust_tweak_value(index, value_direction)) {
+                            tweak_message = "Could not save value";
+                        } else if (_optimizer.is_waiting_for_game()) {
+                            tweak_message = "Value saved for the next session";
+                        } else {
+                            value_reapply_pending = true;
+                            value_reapply_at = GetTickCount64() + 350;
+                            tweak_message = "Value updated";
+                        }
+                    } else if (category_direction) {
                         selected_category = move_carousel(
                             selected_category, category_direction,
                             std::size(TWEAK_CATEGORIES));

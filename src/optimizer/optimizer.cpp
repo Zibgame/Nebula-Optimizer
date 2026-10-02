@@ -52,7 +52,7 @@ size_t tweak_index_for_label(const char* label)
         {"Game DVR off", 2}, {"Background capture off", 3},
         {"Game Bar popup off", 4}, {"Game Mode allowed", 5},
         {"Game Mode on", 5}, {"MMCSS network throttling off", 6},
-        {"MMCSS system reserve: 10%", 7}, {"MMCSS game priority", 8},
+        {"MMCSS system reserve", 7}, {"MMCSS game priority", 8},
         {"MMCSS game scheduling", 9}, {"Foreground CPU scheduling", 10},
         {"High-performance GPU preference", 12},
         {"Game power throttling off", 13}, {"Game CPU priority: high", 14},
@@ -586,6 +586,9 @@ Optimizer::Optimizer()
         load_preferences();
         _saved_tweaks = std::make_unique<SavedTweaks>(
             std::string(local_app_data) + "\\NebulaOptimizer");
+        _saved_tweaks->set_filter_repeat_ms(_filter_repeat_ms);
+        _saved_tweaks->set_tunable_values(_mmcss_reserve_percent,
+            _cpu_epp_percent, _core_parking_percent, _cpu_minimum_percent);
         if (!_saved_tweaks->recover()) {
             _recovery_failed = true;
             _restoration_status = _saved_tweaks->error();
@@ -614,10 +617,20 @@ std::vector<Optimizer::TweakSetting> Optimizer::tweak_settings() const
     const std::lock_guard<std::recursive_mutex> lock(_state_mutex);
     std::vector<TweakSetting> result;
     result.reserve(_tweaks_enabled.size());
-    for (size_t index = 0; index < _tweaks_enabled.size(); ++index)
+    for (size_t index = 0; index < _tweaks_enabled.size(); ++index) {
+        std::string value;
+        if (index == 7) value=std::to_string(_mmcss_reserve_percent)+"%";
+        if (index == 23) value=std::to_string(_cpu_epp_percent)+"%";
+        if (index == 37) value=std::to_string(_core_parking_percent)+"%";
+        if (index == 41) value=std::to_string(_filter_repeat_ms)+" ms";
+        if (index == 44) value=std::to_string(_cpu_minimum_percent)+"%";
+        const bool adjustable=index==7 || index==23 || index==37 ||
+                              index==41 || index==44;
         result.push_back({TWEAK_CATALOG[index].label, TWEAK_CATALOG[index].category,
                           _tweaks_enabled[index], _tweak_status[index],
-                          _saved_tweaks ? _saved_tweaks->info(index) : SavedTweaks::Info{}});
+                          _saved_tweaks ? _saved_tweaks->info(index) : SavedTweaks::Info{},
+                          value, adjustable});
+    }
     return result;
 }
 
@@ -632,6 +645,16 @@ void Optimizer::load_preferences()
         nlohmann::json settings;
         file >> settings;
         const unsigned version = settings.value("_catalog_version", 1u);
+        const DWORD repeat = settings.value("_filter_repeat_ms", DWORD(20));
+        if (repeat >= 10 && repeat <= 50 && repeat % 5 == 0)
+            _filter_repeat_ms = repeat;
+        const auto percent=[](DWORD value,DWORD fallback) {
+            return value<=100 && value%5==0 ? value : fallback;
+        };
+        _mmcss_reserve_percent=percent(settings.value("_mmcss_reserve_percent",DWORD(10)),10);
+        _cpu_epp_percent=percent(settings.value("_cpu_epp_percent",DWORD(0)),0);
+        _core_parking_percent=percent(settings.value("_core_parking_percent",DWORD(100)),100);
+        _cpu_minimum_percent=percent(settings.value("_cpu_minimum_percent",DWORD(100)),100);
         for (size_t index = 0; index < _tweaks_enabled.size(); ++index)
             if (settings.contains(TWEAK_CATALOG[index].id) &&
                 settings[TWEAK_CATALOG[index].id].is_boolean())
@@ -650,6 +673,11 @@ bool Optimizer::save_preferences() const
     try {
         nlohmann::json settings;
         settings["_catalog_version"] = 2;
+        settings["_filter_repeat_ms"] = _filter_repeat_ms;
+        settings["_mmcss_reserve_percent"] = _mmcss_reserve_percent;
+        settings["_cpu_epp_percent"] = _cpu_epp_percent;
+        settings["_core_parking_percent"] = _core_parking_percent;
+        settings["_cpu_minimum_percent"] = _cpu_minimum_percent;
         for (size_t index = 0; index < _tweaks_enabled.size(); ++index)
             settings[TWEAK_CATALOG[index].id] = _tweaks_enabled[index];
         std::filesystem::create_directories(
@@ -684,6 +712,48 @@ bool Optimizer::toggle_tweak(size_t index)
     }
     _tweaks_enabled[index] = !_tweaks_enabled[index];
     return false;
+}
+
+bool Optimizer::enable_all_tweaks()
+{
+    const std::lock_guard<std::recursive_mutex> lock(_state_mutex);
+    const auto previous = _tweaks_enabled;
+    _tweaks_enabled.fill(true);
+    if (!save_preferences()) {
+        _tweaks_enabled = previous;
+        return false;
+    }
+    for (size_t index=0;index<_tweak_status.size();++index)
+        if (previous[index] != _tweaks_enabled[index])
+            _tweak_status[index] = TweakStatus::On;
+    return true;
+}
+
+bool Optimizer::adjust_tweak_value(size_t index, int direction)
+{
+    const std::lock_guard<std::recursive_mutex> lock(_state_mutex);
+    if (!direction) return false;
+    DWORD* value=nullptr; DWORD minimum=0,maximum=100,step=5;
+    if (index==7) value=&_mmcss_reserve_percent;
+    else if (index==23) value=&_cpu_epp_percent;
+    else if (index==37) {value=&_core_parking_percent; minimum=50;}
+    else if (index==41) {
+        value=&_filter_repeat_ms; minimum=10; maximum=50;
+    }
+    else if (index==44) {value=&_cpu_minimum_percent; minimum=50;}
+    else return false;
+    const DWORD previous=*value;
+    *value=direction>0 ? (std::min)(maximum,*value+step) :
+                         (*value<=minimum ? minimum : *value-step);
+    if (*value==previous) return true;
+    if (!save_preferences()) {*value=previous; return false;}
+    if (_saved_tweaks) {
+        _saved_tweaks->set_filter_repeat_ms(_filter_repeat_ms);
+        _saved_tweaks->set_tunable_values(_mmcss_reserve_percent,
+            _cpu_epp_percent,_core_parking_percent,_cpu_minimum_percent);
+    }
+    _tweak_status[index] = _tweaks_enabled[index] ? TweakStatus::On : TweakStatus::Off;
+    return true;
 }
 
 bool Optimizer::scan_saved(const std::string& game_path)
@@ -2184,7 +2254,7 @@ void Optimizer::optimize_input_tuning()
                               ~(FKF_HOTKEYACTIVE | FKF_CONFIRMHOTKEY);
             desired.iWaitMSec = 1;
             desired.iDelayMSec = 100;
-            desired.iRepeatMSec = 20;
+            desired.iRepeatMSec = _filter_repeat_ms;
             desired.iBounceMSec = 0;
             if (same_filter(original, desired)) {
                 set_status(41, TweakStatus::AlreadyConfigured);
@@ -3128,16 +3198,16 @@ bool Optimizer::optimize(const std::string& game_path, bool launch_if_missing)
         _failed.push_back("Temporary power plan unavailable");
     }
     if (power_session_ready && enabled(23))
-        set_ac_power_setting(0, 0, 23, "AC CPU performance preference");
+        set_ac_power_setting(0, _cpu_epp_percent, 23, "AC CPU performance preference");
     if (power_session_ready && enabled(24))
         set_ac_power_setting(1, 0, 24, "AC PCIe link power saving off");
     if (power_session_ready && enabled(25))
         set_ac_power_setting(2, 1, 25, "AC CPU boost mode");
     if (power_session_ready && enabled(44))
-        set_ac_power_setting(7, 100, 44, "AC CPU minimum: 100%");
+        set_ac_power_setting(7, _cpu_minimum_percent, 44, "AC CPU minimum");
     if (power_session_ready && enabled(37)) {
-        set_ac_power_setting(3, 100, 37, "Core parking minimum");
-        set_ac_power_setting(4, 100, 37, "Core parking efficiency class");
+        set_ac_power_setting(3, _core_parking_percent, 37, "Core parking minimum");
+        set_ac_power_setting(4, _core_parking_percent, 37, "Core parking efficiency class");
     }
     if (power_session_ready && enabled(38))
         set_ac_power_setting(5, 0, 38, "AC Wi-Fi performance");
@@ -3174,8 +3244,9 @@ bool Optimizer::optimize(const std::string& game_path, bool launch_if_missing)
         set_dword(HKEY_LOCAL_MACHINE, MMCSS_PROFILE, "NetworkThrottlingIndex",
                   0xFFFFFFFF, "MMCSS network throttling off");
     if (enabled(7))
-        set_dword(HKEY_LOCAL_MACHINE, MMCSS_PROFILE, "SystemResponsiveness", 10,
-                  "MMCSS system reserve: 10%");
+        set_dword(HKEY_LOCAL_MACHINE, MMCSS_PROFILE, "SystemResponsiveness",
+                  _mmcss_reserve_percent,
+                  "MMCSS system reserve");
     if (enabled(8))
         set_dword(HKEY_LOCAL_MACHINE, MMCSS_GAMES, "Priority", 6,
                   "MMCSS game priority");

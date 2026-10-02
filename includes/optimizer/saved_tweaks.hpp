@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <string>
 #include "json.hpp"
 #include "tweak_catalog.hpp"
@@ -23,6 +24,12 @@ public:
     bool has_baseline() const;
     bool has_baseline_for(const std::string& game_path) const;
     bool restore_baseline(const std::string& game_path);
+    void set_filter_repeat_ms(std::uint32_t value) { _filter_repeat_ms = value; }
+    void set_tunable_values(std::uint32_t mmcss, std::uint32_t epp,
+                            std::uint32_t parking, std::uint32_t minimum) {
+        _mmcss_reserve = mmcss; _cpu_epp = epp;
+        _core_parking = parking; _cpu_minimum = minimum;
+    }
     bool apply(size_t index, const std::string& game_path,
                bool confirmed, bool (*confirm_display)() = nullptr);
     bool remove(size_t index);
@@ -55,4 +62,9 @@ private:
     std::array<Info, TWEAK_COUNT> _info{};
     bool _blocked = false;
     std::string _error;
+    std::uint32_t _filter_repeat_ms = 20;
+    std::uint32_t _mmcss_reserve = 10;
+    std::uint32_t _cpu_epp = 0;
+    std::uint32_t _core_parking = 100;
+    std::uint32_t _cpu_minimum = 100;
 };

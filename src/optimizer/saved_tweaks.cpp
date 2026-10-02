@@ -438,7 +438,7 @@ bool SavedTweaks::targets(size_t index, const std::string& game_path, json& out)
     case 5: out.push_back(dword(user,gamebar,"AllowAutoGameMode",1));
             out.push_back(dword(user,gamebar,"AutoGameModeEnabled",1)); break;
     case 6: out.push_back(dword(machine,profile,"NetworkThrottlingIndex",0xffffffff)); break;
-    case 7: out.push_back(dword(machine,profile,"SystemResponsiveness",10)); break;
+    case 7: out.push_back(dword(machine,profile,"SystemResponsiveness",_mmcss_reserve)); break;
     case 8: out.push_back(dword(machine,games,"Priority",6)); break;
     case 9: out.push_back(string_value(machine,games,"Scheduling Category","Medium")); break;
     case 10: out.push_back(dword(machine,"SYSTEM\\CurrentControlSet\\Control\\PriorityControl",
@@ -459,13 +459,13 @@ bool SavedTweaks::targets(size_t index, const std::string& game_path, json& out)
         if (PowerGetActiveScheme(nullptr,&active)!=ERROR_SUCCESS || !active) return false;
         const std::string scheme=guid_string(*active); LocalFree(active);
         if (scheme.empty()) return false;
-        if (index==23) out.push_back(power(0,0,scheme));
+        if (index==23) out.push_back(power(0,_cpu_epp,scheme));
         if (index==24) out.push_back(power(1,0,scheme));
         if (index==25) out.push_back(power(2,1,scheme));
-        if (index==37) {out.push_back(power(3,100,scheme)); out.push_back(power(4,100,scheme));}
+        if (index==37) {out.push_back(power(3,_core_parking,scheme)); out.push_back(power(4,_core_parking,scheme));}
         if (index==38) out.push_back(power(5,0,scheme));
         if (index==39) out.push_back(power(6,0,scheme));
-        if (index==44) out.push_back(power(7,100,scheme));
+        if (index==44) out.push_back(power(7,_cpu_minimum,scheme));
         break;
     }
     case 28: {
@@ -770,7 +770,7 @@ bool SavedTweaks::scan(const std::string& game_path) {
                 FKF_FILTERKEYSON) & ~(FKF_HOTKEYACTIVE|FKF_CONFIRMHOTKEY);
             desired["filter_wait"]=1;
             desired["filter_delay"]=100;
-            desired["filter_repeat"]=20;
+            desired["filter_repeat"]=_filter_repeat_ms;
             desired["filter_bounce"]=0;
             target[0]["desired"]=desired;
         }
@@ -1006,7 +1006,7 @@ bool SavedTweaks::perform(size_t index, const std::string& game_path,
                 ~(FKF_HOTKEYACTIVE|FKF_CONFIRMHOTKEY);
             desired["filter_wait"]=1;
             desired["filter_delay"]=100;
-            desired["filter_repeat"]=20;
+            desired["filter_repeat"]=_filter_repeat_ms;
             desired["filter_bounce"]=0;
             if ((flags & FKF_FILTERKEYSON) && before!=desired) {
                 _error="FilterKeys is already in use"; return false;

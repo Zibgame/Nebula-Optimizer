@@ -21,6 +21,8 @@ public:
         bool enabled;
         TweakStatus status;
         SavedTweaks::Info durable;
+        std::string value;
+        bool adjustable = false;
     };
     Optimizer();
     ~Optimizer();
@@ -45,6 +47,8 @@ public:
     const std::string& restoration_status() const;
     std::vector<TweakSetting> tweak_settings() const;
     bool toggle_tweak(size_t index);
+    bool enable_all_tweaks();
+    bool adjust_tweak_value(size_t index, int direction);
     bool scan_saved(const std::string& game_path);
     bool has_baseline_scan(const std::string& game_path = {}) const;
     bool save_tweak(size_t index, const std::string& game_path,
@@ -233,6 +237,11 @@ private:
     bool _network_restart_needed = false;
     bool _timer_resolution_active = false;
     bool _watchdog_started = false;
+    DWORD _filter_repeat_ms = 20;
+    DWORD _mmcss_reserve_percent = 10;
+    DWORD _cpu_epp_percent = 0;
+    DWORD _core_parking_percent = 100;
+    DWORD _cpu_minimum_percent = 100;
     std::vector<std::string> _applied;
     std::vector<std::string> _failed;
     std::string _last_error;

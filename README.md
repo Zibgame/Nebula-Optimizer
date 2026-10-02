@@ -87,6 +87,12 @@ During an active session the monitor thread runs below normal priority, hidden
 UI updates sleep, helper discovery is rate-limited, and display discovery stops
 after a valid monitor was checked. PresentMon is never started automatically:
 only `Capture` or `A/B test` runs it.
+`Apply All` enables the complete catalog after one confirmation. On ordinary
+rows, Left/Right keeps moving between tabs. On rows with an inline value,
+Left/Right adjusts that value in its native unit instead; FilterKeys repeat uses
+5 ms steps. Holding an arrow relies on Windows key repeat, and Nebula waits for
+the adjustment to stop before reapplying the session once. `H/L` always moves
+between tabs.
 If recovery is incomplete, close the game and press `R` to retry.
 
 The attached optimization plan is only partially implemented. See
