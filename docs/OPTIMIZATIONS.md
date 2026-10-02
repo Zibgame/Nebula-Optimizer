@@ -22,6 +22,15 @@ not copy source code from other optimizers.
 - Offer a default-off accessibility-hotkey option: if FilterKeys, StickyKeys,
   or ToggleKeys is not in use, temporarily prevent its activation shortcut and
   restore the original structures after the session.
+- Offer a separate default-off FilterKeys fast-repeat preset through Windows' own
+  accessibility API. It never replaces an already-active custom FilterKeys setup.
+  Keyboard repeat delay/rate are separate default-off session controls. Nebula
+  never changes mouse acceleration, sensitivity, speed, or pointer curves.
+  These keyboard controls affect Windows input behavior, not necessarily a game
+  using raw input; each original value is journaled and restored.
+- Offer an experimental AC minimum processor state of 100% on the temporary
+  power plan. It may reduce frequency ramping at the cost of heat and power;
+  it is not enabled by default.
 - If needed, re-enable the game's dynamic priority boosts and restore its
   previous memory priority to normal; both are skipped when already optimal.
 - Temporarily select the highest tested refresh rate at the primary display's
@@ -100,12 +109,28 @@ The rule is simple: a 0.1% improvement is welcome when it has a plausible path,
 can be measured, and can be restored. A tweak is not included merely because it
 appears in many scripts.
 
-Nebula displays actual CPU and RAM usage. It does not invent a "system latency"
-or input-to-edit figure. Pressing P starts a 10-second on-demand capture with an
-official `PresentMon.exe` supplied by the user. Nebula averages up to the last
-100 valid `MsAllInputToPhotonLatency` samples for the actual game PID, then
-labels the result input-to-display. No capture or input hook runs by default.
-This metric does not identify whether a specific Fortnite edit succeeded.
+MMCSS `Tasks\Games`, network throttling, system responsiveness, and
+`Win32PrioritySeparation` are experimental and off by default. A registry value
+that is present or written/read back is shown as `Set`; Nebula does not claim
+that Fortnite registered its important threads with the MMCSS task. The GPU
+preference is written before a Nebula launch. On an already-running game it is
+shown as `Next run`, because the current process cannot be proven to use it.
+
+EcoQoS handling distinguishes Windows automatic policy (`ControlMask=0`) from
+explicit EcoQoS and explicit HighQoS. Nebula preserves unrelated power-
+throttling bits, verifies the requested masks, and journals the exact original
+state for compare-and-swap restoration.
+
+Nebula displays actual CPU and RAM usage. It does not invent a physical
+input-to-edit figure. An on-demand 10-second capture with a user-supplied
+official `PresentMon.exe` parses the complete CSV period and reports valid
+sample count, coverage, median/mean/p95/p99, frame pacing, FPS, 1% low,
+stutters, and available CPU/GPU/click columns. Missing, invalid, and unsupported
+schemas are distinct. `A/B test` runs three warmed baseline/optimized pairs,
+reports dispersion-aware improvement/regression, and records the raw summaries,
+session changes, errors, and basic hardware inventory. These software telemetry
+metrics do not prove full peripheral-to-display latency or that a particular
+Fortnite edit succeeded.
 Full end-to-end click-to-display testing can
 also use a compatible NVIDIA Reflex Analyzer monitor and mouse. Epic's 2026
 Fortnite guide recommends Reflex On + Boost for NVIDIA users; Nebula does not

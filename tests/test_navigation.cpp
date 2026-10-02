@@ -19,9 +19,9 @@ int main()
     const auto settings = optimizer.tweak_settings();
     size_t total = 0;
     for (const char* category : {"CPU & Power", "GPU & Display", "Memory",
-                                 "Background", "Input & Capture"})
+                                 "Background", "Input & Capture", "Network"})
         total += tweaks_in_category(settings, category).size();
-    const bool okay = total == 41 &&
+    const bool okay = total == 60 &&
         make_carousel({"CPU", "GPU", "RAM"}).text ==
             "TWEAKS   CPU   GPU   RAM " &&
         make_carousel({"CPU", "GPU"}).tab_columns[0].first == 12 &&

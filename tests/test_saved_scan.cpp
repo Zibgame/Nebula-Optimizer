@@ -18,7 +18,9 @@ int main()
         SavedTweaks saved(unique);
         okay = saved.recover() && saved.scan("") && okay;
         okay = !saved.info(1).eligible && saved.info(2).eligible &&
-               saved.info(12).unknown && saved.info(40).eligible && okay;
+               saved.info(12).unknown && saved.info(40).eligible &&
+               saved.info(41).eligible && saved.info(44).eligible &&
+               saved.info(45).eligible && okay;
         nlohmann::json first;
         { std::ifstream file(std::string(unique)+"\\baseline.json"); file >> first; }
         okay = first.at("gpu_preference").at("first").is_null() && okay;
@@ -27,13 +29,13 @@ int main()
         { std::ifstream file(std::string(unique)+"\\baseline.json"); file >> second; }
         okay = first.at("game_dvr").at("first") ==
                second.at("game_dvr").at("first") && okay;
-        size_t candidate=41;
-        for (size_t i=0;i<41;++i) {
+        size_t candidate=60;
+        for (size_t i=0;i<60;++i) {
             const auto item=saved.info(i);
             if (item.saved) okay=item.base && item.eligible && okay;
-            if (candidate==41 && item.saved && i!=40) candidate=i;
+            if (candidate==60 && item.saved && i!=40) candidate=i;
         }
-        if (candidate<41) {
+        if (candidate<60) {
             okay=saved.remove(candidate) && !saved.info(candidate).saved && okay;
             okay=saved.scan("") && !saved.info(candidate).saved && okay;
             SavedTweaks reopened(unique);

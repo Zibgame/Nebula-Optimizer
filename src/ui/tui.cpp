@@ -1,15 +1,21 @@
 #include "tui.hpp"
+#include "presentmon_metrics.hpp"
 #include "tui_colors.hpp"
 #include "tweak_navigation.hpp"
 #include "tui_view.hpp"
+#include "impact_estimate.hpp"
+#include "json.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <conio.h>
 #include <filesystem>
 #include <fstream>
 #include <deque>
 #include <cmath>
+#include <cwchar>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <psapi.h>
@@ -25,23 +31,114 @@ int box_width = 68;
 int box_margin = 2;
 constexpr const char* TWEAK_CATEGORIES[] = {
     "CPU & Power", "GPU & Display", "Memory", "Background",
-    "Input & Capture", "Saved"
+    "Input & Capture", "Network", "Saved"
 };
 constexpr const char* TWEAK_TABS[] = {
-    "CPU", "GPU", "RAM", "Apps", "Input", "Saved"
+    "CPU", "GPU", "RAM", "Apps", "Input", "Net", "Saved"
 };
+constexpr size_t CLOSE_APPS_ROW = static_cast<size_t>(-1);
+
+enum class MenuKey { None, Up, Down, Left, Right, Select, Back };
+enum class SessionAction { Save, Reapply, Capture, Benchmark, Tray, Stop };
+
+void wait_for_menu_key(DWORD timeout)
+{
+    if (_kbhit()) return;
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    if (!input || input == INVALID_HANDLE_VALUE) {
+        Sleep(timeout);
+        return;
+    }
+    for (int index = 0; index < 32; ++index) {
+        INPUT_RECORD event{};
+        DWORD available = 0;
+        if (!PeekConsoleInputA(input, &event, 1, &available) || !available)
+            break;
+        if (event.EventType == KEY_EVENT && event.Event.KeyEvent.bKeyDown)
+            return;
+        DWORD consumed = 0;
+        if (!ReadConsoleInputA(input, &event, 1, &consumed) || !consumed)
+            break;
+    }
+    if (!_kbhit() && WaitForSingleObject(input, timeout) == WAIT_FAILED)
+        Sleep(timeout);
+}
+
+class MenuCursorGuard {
+public:
+    MenuCursorGuard() : _output(GetStdHandle(STD_OUTPUT_HANDLE))
+    {
+        if (_output == INVALID_HANDLE_VALUE ||
+            !GetConsoleCursorInfo(_output, &_original)) return;
+        CONSOLE_CURSOR_INFO hidden = _original;
+        hidden.bVisible = FALSE;
+        _active = SetConsoleCursorInfo(_output, &hidden);
+    }
+
+    ~MenuCursorGuard()
+    {
+        if (_active) SetConsoleCursorInfo(_output, &_original);
+    }
+
+private:
+    HANDLE _output;
+    CONSOLE_CURSOR_INFO _original{};
+    bool _active = false;
+};
+
+const char* action_label(SessionAction action, bool saved = false)
+{
+    switch (action) {
+    case SessionAction::Save: return saved ? "Unsave" : "Save";
+    case SessionAction::Reapply: return "Reapply";
+    case SessionAction::Capture: return "Capture";
+    case SessionAction::Benchmark: return "A/B test";
+    case SessionAction::Tray: return "Tray";
+    case SessionAction::Stop: return "Stop";
+    }
+    return "";
+}
+
+MenuKey read_menu_key()
+{
+    const int key = _getch();
+    if (key == 0 || key == 224) {
+        switch (_getch()) {
+        case 72: return MenuKey::Up;
+        case 80: return MenuKey::Down;
+        case 75: return MenuKey::Left;
+        case 77: return MenuKey::Right;
+        default: return MenuKey::None;
+        }
+    }
+    switch (key) {
+    case 'j': case 'J': return MenuKey::Down;
+    case 'k': case 'K': return MenuKey::Up;
+    case 'h': case 'H': return MenuKey::Left;
+    case 'l': case 'L': return MenuKey::Right;
+    case 13: return MenuKey::Select;
+    case 27: case 8: return MenuKey::Back;
+    default: return MenuKey::None;
+    }
+}
 
 bool confirm_display_mode()
 {
-    std::cout << "\nKeep this display mode? [Y] within 15 seconds: " << std::flush;
+    bool keep = false;
     const ULONGLONG deadline = GetTickCount64() + 15000;
     while (GetTickCount64() < deadline) {
+        const auto seconds = (deadline - GetTickCount64() + 999) / 1000;
+        std::cout << "\r\033[2KKeep display mode? " <<
+            (keep ? " Revert  > Keep" : "> Revert    Keep") <<
+            "  " << seconds << "s  [Enter]" << std::flush;
         if (_kbhit()) {
-            const int key = _getch();
-            if (key == 'y' || key == 'Y') return true;
-            if (key == 'n' || key == 'N' || key == 27) return false;
+            const MenuKey key = read_menu_key();
+            if (key == MenuKey::Right || key == MenuKey::Down) keep = true;
+            if (key == MenuKey::Left || key == MenuKey::Up) keep = false;
+            if (key == MenuKey::Select) return keep;
+            if (key == MenuKey::Back) return false;
         }
-        Sleep(50);
+        wait_for_menu_key(50);
     }
     return false;
 }
@@ -52,6 +149,8 @@ const char* view_label(ViewState state)
 {
     switch (state) {
     case ViewState::Applied: return "Applied";
+    case ViewState::Configured: return "Set";
+    case ViewState::Restart: return "Next run";
     case ViewState::Skipped: return "Skipped";
     case ViewState::Failed: return "Failed";
     case ViewState::Off: return "Off";
@@ -65,6 +164,8 @@ const char* view_color(ViewState state)
 {
     switch (state) {
     case ViewState::Applied: return LIGHT_GREEN;
+    case ViewState::Configured: return LIGHT_CYAN;
+    case ViewState::Restart: return LIGHT_YELLOW;
     case ViewState::Skipped: return LIGHT_YELLOW;
     case ViewState::Failed: return LIGHT_RED;
     case ViewState::Drift: return LIGHT_RED;
@@ -259,18 +360,195 @@ std::string memory_bar(double ratio, int width)
     return repeat("█", filled) + repeat("░", width - filled);
 }
 
+std::string benchmark_comparison(const std::vector<PresentMonMetrics>& before,
+                                 const std::vector<PresentMonMetrics>& after)
+{
+    const auto mean_of = [](const std::vector<PresentMonMetrics>& runs,
+                            bool input, bool p95) {
+        double total = 0.0; size_t count = 0;
+        for (const auto& run : runs) {
+            const MetricSummary& metric = input ? run.input : run.frame;
+            if (!metric.samples) continue;
+            total += p95 ? metric.p95 : metric.median; ++count;
+        }
+        return count ? total / count : 0.0;
+    };
+    const double before_input = mean_of(before, true, false);
+    const double after_input = mean_of(after, true, false);
+    const double before_frame = mean_of(before, false, true);
+    const double after_frame = mean_of(after, false, true);
+    const auto spread = [&](const std::vector<PresentMonMetrics>& runs, bool input) {
+        const double center = mean_of(runs, input, !input);
+        double total = 0.0; size_t count = 0;
+        for (const auto& run : runs) {
+            const MetricSummary& metric = input ? run.input : run.frame;
+            if (!metric.samples) continue;
+            total += std::abs((input ? metric.median : metric.p95) - center); ++count;
+        }
+        return count ? total / count : 0.0;
+    };
+    const double noise = (std::max)(spread(before, true), spread(after, true));
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1) << "A/B " << before.size() << "x: ";
+    if (before_input && after_input)
+        out << "input " << (after_input - before_input) << " ms";
+    else out << "input n/a";
+    if (before_frame && after_frame)
+        out << "  frame p95 " << (after_frame - before_frame) << " ms";
+    if (before_input && after_input)
+        out << (before_input - after_input > noise && before_input > after_input ?
+                "  repeatable improvement" :
+                after_input - before_input > noise ? "  regression" : "  within variation");
+    return out.str();
+}
+
+void save_benchmark_report(const std::vector<PresentMonMetrics>& before,
+                           const std::vector<PresentMonMetrics>& after,
+                           const std::vector<Optimizer::TweakSetting>& settings,
+                           const std::vector<std::string>& errors)
+{
+    char local[MAX_PATH]{};
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", local, sizeof(local))) return;
+    try {
+        const std::filesystem::path directory =
+            std::filesystem::path(local) / "NebulaOptimizer";
+        std::filesystem::create_directories(directory);
+        nlohmann::json report;
+        SYSTEM_INFO system{}; GetNativeSystemInfo(&system);
+        MEMORYSTATUSEX memory{}; memory.dwLength = sizeof(memory);
+        GlobalMemoryStatusEx(&memory);
+        report["hardware"] = {{"logical_processors", system.dwNumberOfProcessors},
+            {"architecture", system.wProcessorArchitecture},
+            {"physical_memory_mb", memory.ullTotalPhys / (1024 * 1024)}};
+        SYSTEM_POWER_STATUS power{};
+        if (GetSystemPowerStatus(&power)) {
+            report["hardware"]["ac_connected"] = power.ACLineStatus == 1;
+            report["hardware"]["battery_present"] = power.BatteryFlag != 128;
+        }
+        DWORD topology_size = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr,
+                                         &topology_size);
+        std::vector<unsigned char> topology(topology_size);
+        bool hybrid = false;
+        BYTE first_efficiency = 0;
+        bool have_efficiency = false;
+        if (topology_size && GetLogicalProcessorInformationEx(RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(topology.data()),
+            &topology_size)) {
+            size_t offset = 0;
+            while (offset < topology_size) {
+                const auto* item = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+                    topology.data() + offset);
+                const BYTE efficiency = item->Processor.EfficiencyClass;
+                if (have_efficiency && efficiency != first_efficiency) hybrid = true;
+                first_efficiency = efficiency; have_efficiency = true;
+                if (!item->Size) break;
+                offset += item->Size;
+            }
+        }
+        report["hardware"]["hybrid_cpu"] = hybrid;
+        report["hardware"]["display_adapters"] = nlohmann::json::array();
+        for (DWORD index = 0; ; ++index) {
+            DISPLAY_DEVICEA adapter{}; adapter.cb = sizeof(adapter);
+            if (!EnumDisplayDevicesA(nullptr, index, &adapter, 0)) break;
+            if (adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
+                report["hardware"]["display_adapters"].push_back(adapter.DeviceString);
+        }
+        const auto encode = [](const PresentMonMetrics& run) {
+            return nlohmann::json{{"rows", run.rows}, {"valid_frames", run.valid_frames},
+                {"coverage_seconds", run.coverage_seconds},
+                {"input_median_ms", run.input.median}, {"input_p95_ms", run.input.p95},
+                {"input_p99_ms", run.input.p99}, {"click_median_ms", run.click.median},
+                {"frame_median_ms", run.frame.median}, {"frame_p95_ms", run.frame.p95},
+                {"frame_p99_ms", run.frame.p99}, {"average_fps", run.average_fps},
+                {"one_percent_low_fps", run.one_percent_low_fps},
+                {"frame_cv_percent", run.frame_cv_percent}, {"stutters", run.stutters},
+                {"cpu_mean_ms", run.cpu.mean}, {"gpu_mean_ms", run.gpu.mean}};
+        };
+        report["before"] = nlohmann::json::array();
+        report["after"] = nlohmann::json::array();
+        for (const auto& run : before) report["before"].push_back(encode(run));
+        for (const auto& run : after) report["after"].push_back(encode(run));
+        report["session_changes"] = nlohmann::json::array();
+        for (const auto& setting : settings)
+            if (setting.status == Optimizer::TweakStatus::Applied)
+                report["session_changes"].push_back(setting.label);
+        report["errors"] = errors;
+        const auto final_path = directory / "benchmark-last.json";
+        const auto temporary = directory / "benchmark-last.json.tmp";
+        { std::ofstream out(temporary, std::ios::trunc); out << report.dump(2); }
+        MoveFileExA(temporary.string().c_str(), final_path.string().c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    } catch (...) {}
+}
+
 ULONGLONG ticks(const FILETIME& time)
 {
     return (static_cast<ULONGLONG>(time.dwHighDateTime) << 32) |
            time.dwLowDateTime;
 }
 
+class CoreCpuMonitor {
+public:
+    double sample()
+    {
+        struct Entry {
+            LARGE_INTEGER idle, kernel, user, dpc, interrupt;
+            ULONG interrupt_count;
+        };
+        if (!_query) {
+            const FARPROC address = GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                                   "NtQuerySystemInformation");
+            static_assert(sizeof(_query) == sizeof(address), "function pointer size");
+            std::memcpy(&_query, &address, sizeof(_query));
+        }
+        if (!_query) return 0.0;
+        SYSTEM_INFO info{}; GetNativeSystemInfo(&info);
+        std::vector<Entry> values(info.dwNumberOfProcessors);
+        unsigned long returned = 0;
+        if (_query(8, values.data(), static_cast<unsigned long>(values.size() * sizeof(Entry)),
+                   &returned) < 0)
+            return 0.0;
+        const size_t count = returned / sizeof(Entry);
+        if (_idle.size() != count) {
+            _idle.resize(count); _total.resize(count);
+            for (size_t i = 0; i < count; ++i) {
+                _idle[i] = values[i].idle.QuadPart;
+                _total[i] = values[i].kernel.QuadPart + values[i].user.QuadPart;
+            }
+            return 0.0;
+        }
+        double peak = 0.0;
+        for (size_t i = 0; i < count; ++i) {
+            const ULONGLONG idle = values[i].idle.QuadPart;
+            const ULONGLONG total = values[i].kernel.QuadPart + values[i].user.QuadPart;
+            if (total > _total[i]) {
+                const double busy = 100.0 * (1.0 - static_cast<double>(idle - _idle[i]) /
+                                              static_cast<double>(total - _total[i]));
+                peak = (std::max)(peak, (std::max)(0.0, (std::min)(100.0, busy)));
+            }
+            _idle[i] = idle; _total[i] = total;
+        }
+        return peak;
+    }
+private:
+    using Query = LONG (WINAPI*)(int, void*, unsigned long, unsigned long*);
+    Query _query = nullptr;
+    std::vector<ULONGLONG> _idle, _total;
+};
+
 class LatencyCapture {
 public:
     ~LatencyCapture()
     {
-        if (_process)
+        if (_process) {
+            if (WaitForSingleObject(_process, 0) == WAIT_TIMEOUT) {
+                TerminateProcess(_process, 0);
+                WaitForSingleObject(_process, 1000);
+            }
             CloseHandle(_process);
+        }
+        remove_capture_file();
     }
 
     bool start(DWORD pid)
@@ -278,7 +556,12 @@ public:
         if (!pid || _process)
             return false;
         char module[MAX_PATH * 4]{};
-        GetModuleFileNameA(nullptr, module, sizeof(module));
+        const DWORD module_length = GetModuleFileNameA(nullptr, module,
+                                                       sizeof(module));
+        if (!module_length || module_length >= sizeof(module)) {
+            _status = "Nebula path unavailable";
+            return false;
+        }
         std::filesystem::path executable =
             std::filesystem::path(module).parent_path() / "PresentMon.exe";
         if (!std::filesystem::exists(executable)) {
@@ -292,7 +575,9 @@ public:
             executable = found;
         }
         char local[MAX_PATH]{};
-        if (!GetEnvironmentVariableA("LOCALAPPDATA", local, sizeof(local))) {
+        const DWORD local_length = GetEnvironmentVariableA("LOCALAPPDATA", local,
+                                                          sizeof(local));
+        if (!local_length || local_length >= sizeof(local)) {
             _status = "AppData unavailable";
             return false;
         }
@@ -320,6 +605,7 @@ public:
                             nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
                             nullptr, nullptr, &startup, &child)) {
             _status = "PresentMon could not start";
+            remove_capture_file();
             return false;
         }
         CloseHandle(child.hThread);
@@ -339,71 +625,44 @@ public:
         _process = nullptr;
         if (code != 0) {
             _status = "PresentMon capture failed";
+            remove_capture_file();
             return;
         }
         read_result();
+        remove_capture_file();
     }
 
     const std::string& status() const { return _status; }
+    bool running() const { return _process != nullptr; }
+    bool take_result(PresentMonMetrics& result)
+    {
+        if (!_result_ready) return false;
+        result = _last_result;
+        _result_ready = false;
+        return true;
+    }
 
 private:
+    void remove_capture_file()
+    {
+        if (!_csv_path.empty()) {
+            DeleteFileA(_csv_path.c_str());
+            _csv_path.clear();
+        }
+    }
+
     void read_result()
     {
-        std::ifstream file(_csv_path);
-        std::string line;
-        if (!file || !std::getline(file, line)) {
-            _status = "No PresentMon data";
-            return;
-        }
-        std::stringstream headers(line);
-        std::string column;
-        size_t metric_index = 0;
-        bool found = false;
-        while (std::getline(headers, column, ',')) {
-            if (column == "MsAllInputToPhotonLatency") {
-                found = true;
-                break;
-            }
-            ++metric_index;
-        }
-        if (!found) {
-            _status = "Input metric unavailable";
-            return;
-        }
-        std::deque<double> samples;
-        double total = 0.0;
-        while (std::getline(file, line)) {
-            std::stringstream fields(line);
-            size_t index = 0;
-            while (index <= metric_index && std::getline(fields, column, ',')) {
-                if (index++ != metric_index)
-                    continue;
-                try {
-                    const double value = std::stod(column);
-                    if (std::isfinite(value) && value > 0.0) {
-                        samples.push_back(value);
-                        total += value;
-                        if (samples.size() > 100) {
-                            total -= samples.front();
-                            samples.pop_front();
-                        }
-                    }
-                } catch (...) {}
-            }
-        }
-        if (samples.empty()) {
-            _status = "No input samples";
-            return;
-        }
-        std::ostringstream measured;
-        measured << "Input-to-display: " << std::fixed << std::setprecision(1)
-                 << total / samples.size() << " ms (PresentMon)";
-        _status = measured.str();
+        _last_result = parse_presentmon_file(_csv_path);
+        _result_ready = true;
+        _status = presentmon_compact_text(_last_result);
     }
 
     HANDLE _process = nullptr;
     std::string _csv_path;
     std::string _status = "Input-to-display: not measured";
+    PresentMonMetrics _last_result{};
+    bool _result_ready = false;
 };
 
 } // namespace
@@ -465,6 +724,7 @@ private:
                 tray->_show.store(true);
             if (lparam == WM_RBUTTONUP) {
                 HMENU menu = CreatePopupMenu();
+                if (!menu) return 0;
                 AppendMenuA(menu, MF_STRING, SHOW_COMMAND, "Open Nebula");
                 AppendMenuA(menu, MF_STRING, STOP_COMMAND, "Stop and restore");
                 POINT cursor{};
@@ -508,6 +768,7 @@ private:
         _window = window;
         if (!window) {
             _ready.store(true);
+            UnregisterClassA(klass.lpszClassName, instance);
             return;
         }
         NOTIFYICONDATAA icon{};
@@ -528,6 +789,7 @@ private:
             DispatchMessageA(&message);
         }
         Shell_NotifyIconA(NIM_DELETE, &icon);
+        UnregisterClassA(klass.lpszClassName, instance);
     }
 
     std::thread _thread;
@@ -550,6 +812,16 @@ Tui::Tui()
 Tui::~Tui()
 {
     _optimizer.restore();
+    if (_console_font_changed) {
+        HANDLE output=GetStdHandle(STD_OUTPUT_HANDLE);
+        CONSOLE_FONT_INFOEX current{};
+        current.cbSize=sizeof(current);
+        if (output!=INVALID_HANDLE_VALUE &&
+            GetCurrentConsoleFontEx(output,FALSE,&current) &&
+            _wcsicmp(current.FaceName,_applied_console_font.FaceName)==0 &&
+            current.dwFontSize.Y==_applied_console_font.dwFontSize.Y)
+            SetCurrentConsoleFontEx(output,FALSE,&_original_console_font);
+    }
     std::cout << "\033[0m\033[?25h";
 }
 
@@ -573,6 +845,40 @@ void Tui::init()
     HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD mode = 0;
     if (output != INVALID_HANDLE_VALUE && GetConsoleMode(output, &mode)) {
+        // Only the classic console owns its font. Windows Terminal and other
+        // hosts keep their own user-selected font settings.
+        if (GetEnvironmentVariableW(L"WT_SESSION",nullptr,0)==0 &&
+            GetConsoleWindow() && IsWindowVisible(GetConsoleWindow())) {
+            CONSOLE_FONT_INFOEX original{};
+            original.cbSize=sizeof(original);
+            if (GetCurrentConsoleFontEx(output,FALSE,&original) &&
+                ((original.FontFamily & TMPF_TRUETYPE)==0 ||
+                 original.FaceName[0]==L'\0' ||
+                 _wcsicmp(original.FaceName,L"Terminal")==0 ||
+                 _wcsicmp(original.FaceName,L"__DefaultTTFont__")==0 ||
+                 ((_wcsicmp(original.FaceName,L"Consolas")==0 ||
+                   _wcsicmp(original.FaceName,L"Lucida Console")==0) &&
+                  original.dwFontSize.Y<18))) {
+                CONSOLE_FONT_INFOEX desired=original;
+                desired.dwFontSize={0,18};
+                desired.FontFamily=FF_MODERN | TMPF_VECTOR | TMPF_TRUETYPE;
+                desired.FontWeight=FW_NORMAL;
+                std::wmemset(desired.FaceName,0,LF_FACESIZE);
+                std::wmemcpy(desired.FaceName,L"Consolas",8);
+                if (SetCurrentConsoleFontEx(output,FALSE,&desired)) {
+                    CONSOLE_FONT_INFOEX verified{};
+                    verified.cbSize=sizeof(verified);
+                    if (GetCurrentConsoleFontEx(output,FALSE,&verified) &&
+                        _wcsicmp(verified.FaceName,L"Consolas")==0) {
+                        _original_console_font=original;
+                        _applied_console_font=verified;
+                        _console_font_changed=true;
+                    } else {
+                        SetCurrentConsoleFontEx(output,FALSE,&original);
+                    }
+                }
+            }
+        }
         SetConsoleMode(output, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
         CONSOLE_SCREEN_BUFFER_INFOEX info{};
         info.cbSize = sizeof(info);
@@ -609,6 +915,81 @@ std::string Tui::read_input(const std::string& prompt)
     return value;
 }
 
+int Tui::select_menu(const std::string& heading,
+                     const std::vector<std::string>& options, size_t initial)
+{
+    if (options.empty()) return -1;
+    MenuCursorGuard cursor_guard;
+    size_t cursor = (std::min)(initial, options.size() - 1);
+    size_t scroll = 0;
+    bool redraw = true;
+    std::vector<std::string> previous_frame;
+    ULONGLONG next_game_check = 0;
+    while (true) {
+        if (_tray && _tray->stop_requested()) return -1;
+        const ULONGLONG now = GetTickCount64();
+        if (now >= next_game_check) {
+            next_game_check = now + 500;
+            if ((_optimizer.has_game_process() || _optimizer.is_waiting_for_game()) &&
+                !_optimizer.is_game_running()) return -1;
+        }
+        if (_tray && _tray->show_requested()) {
+            HWND window = GetConsoleWindow();
+            if (window) {
+                ShowWindow(window, SW_SHOW);
+                ShowWindow(window, SW_RESTORE);
+                SetForegroundWindow(window);
+            }
+        }
+        HWND window = GetConsoleWindow();
+        if (window && IsIconic(window)) ShowWindow(window, SW_HIDE);
+        if (redraw) {
+            update_layout();
+            std::ostringstream frame;
+            frame_output = &frame;
+            frame_line = 0;
+            title(heading);
+            CONSOLE_SCREEN_BUFFER_INFO info{};
+            const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+            size_t visible = 10;
+            if (output != INVALID_HANDLE_VALUE &&
+                GetConsoleScreenBufferInfo(output, &info)) {
+                const int height = info.srWindow.Bottom - info.srWindow.Top + 1;
+                visible = static_cast<size_t>((std::max)(1,
+                    (std::min)(10, height - 9)));
+            }
+            scroll = scroll_to_cursor(scroll, cursor, visible);
+            for (size_t index = scroll;
+                 index < options.size() && index < scroll + visible; ++index)
+                row(std::string(index == cursor ? "> " : "  ") + options[index],
+                    index == cursor ? LIGHT_PURPLE : WHITE);
+            divider();
+            row("[J/K or arrows] Move  [Enter/L] Select  [Esc/H] Back",
+                BRIGHT_BLACK);
+            bottom_border();
+            frame_output = &std::cout;
+            present_frame(frame.str(), previous_frame);
+            redraw = false;
+        }
+        if (!_kbhit()) { wait_for_menu_key(100); continue; }
+        switch (read_menu_key()) {
+        case MenuKey::Up:
+            cursor = move_tweak_cursor(cursor, -1, options.size());
+            redraw = true;
+            break;
+        case MenuKey::Down:
+            cursor = move_tweak_cursor(cursor, 1, options.size());
+            redraw = true;
+            break;
+        case MenuKey::Right:
+        case MenuKey::Select: return static_cast<int>(cursor);
+        case MenuKey::Left:
+        case MenuKey::Back: return -1;
+        default: break;
+        }
+    }
+}
+
 void Tui::pause(const std::string& message)
 {
     read_input(message);
@@ -630,51 +1011,76 @@ void Tui::select_default_profile()
 
 void Tui::startup_screen()
 {
-    clear_screen();
-    title("");
+    MenuCursorGuard cursor_guard;
+    enum class Action { Play, Profiles, Windows, Scan, Tray, Retry, Exit };
+    std::vector<std::pair<Action, std::string>> actions = {
+        {Action::Play, _selected_profile.empty() ? "Create profile" :
+                       "Play / optimize"},
+        {Action::Profiles, "Profiles"},
+        {Action::Windows, "Optimize Windows"},
+        {Action::Scan, "Scan PC"},
+        {Action::Tray, "Hide to tray"}
+    };
+    if (_optimizer.recovery_blocked())
+        actions.push_back({Action::Retry, "Retry restore"});
+    actions.push_back({Action::Exit, "Exit"});
+    _home_cursor = (std::min)(_home_cursor, actions.size() - 1);
     const auto settings=_optimizer.tweak_settings();
     size_t base_count=0, saved_count=0;
     for (const auto& item:settings) {
         if (item.durable.base) ++base_count;
         if (item.durable.saved) ++saved_count;
     }
-
-    if (_selected_profile.empty()) {
-        row("No profile", LIGHT_YELLOW);
-    } else {
-        row("Profile: " + _selected_profile, LIGHT_GREEN);
-        row("Auto-detect: on", BRIGHT_BLACK);
-    }
-
-    divider();
-    if (_selected_profile.empty())
-        row("[1] Create profile",LIGHT_GREEN);
-    else
-        row("[1] Play / optimize",LIGHT_GREEN);
-    row("[2] Profiles",WHITE);
-    row("[3] Optimize Windows",WHITE);
-    row("[4] About tweaks",WHITE);
-    row("[S] Scan PC",LIGHT_CYAN);
-    row("[M] Hide to tray",WHITE);
-    if (_optimizer.recovery_blocked())
-        row("[R] Retry restore (close the game first)",LIGHT_YELLOW);
-    row("[0] Exit",BRIGHT_BLACK);
-    divider();
-    row(std::string("Admin: ") + (elevated() ? "on" : "off"),
-        elevated() ? LIGHT_GREEN : LIGHT_YELLOW);
-    row("Base: " + std::to_string(base_count) +
-        "  |  Saved: " + std::to_string(saved_count),LIGHT_CYAN);
-    if (!_scan_message.empty()) row(_scan_message, LIGHT_YELLOW);
-    if (!_optimizer.restoration_status().empty())
-        row(_optimizer.restoration_status(),
-            _optimizer.restoration_succeeded() ? LIGHT_GREEN : LIGHT_RED);
-    bottom_border();
-
-    std::cout << "\n" << std::string(box_margin+2,' ') << "> ";
-    std::cout.flush();
-    std::string choice;
+    bool redraw = true;
+    size_t scroll = 0;
+    std::vector<std::string> previous_frame;
     ULONGLONG next_scan = 0;
     while (_is_running) {
+        if (redraw) {
+            update_layout();
+            CONSOLE_SCREEN_BUFFER_INFO info{};
+            size_t visible = actions.size();
+            const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (output != INVALID_HANDLE_VALUE &&
+                GetConsoleScreenBufferInfo(output, &info)) {
+                const int height = info.srWindow.Bottom - info.srWindow.Top + 1;
+                const int fixed = 8 + (_selected_profile.empty() ? 1 : 2) +
+                    (!_scan_message.empty() ? 1 : 0) +
+                    (!_optimizer.restoration_status().empty() ? 1 : 0);
+                visible = (std::min)(actions.size(), static_cast<size_t>(
+                    (std::max)(1, height-fixed)));
+            }
+            scroll = scroll_to_cursor(scroll, _home_cursor, visible);
+            std::ostringstream frame;
+            frame_output = &frame;
+            frame_line = 0;
+            title("");
+            if (_selected_profile.empty()) row("No profile", LIGHT_YELLOW);
+            else {
+                row("Profile: " + _selected_profile, LIGHT_GREEN);
+                row("Auto-detect: on", BRIGHT_BLACK);
+            }
+            divider();
+            for (size_t index=scroll;
+                 index<actions.size() && index<scroll+visible; ++index)
+                row(std::string(index == _home_cursor ? "> " : "  ") +
+                    actions[index].second,
+                    index == _home_cursor ? LIGHT_PURPLE : WHITE);
+            divider();
+            row("[J/K or arrows] Move  [Enter/L] Select  [Esc] Tray",
+                BRIGHT_BLACK);
+            row(std::string("Admin: ") + (elevated() ? "on" : "off") +
+                "  |  Base: " + std::to_string(base_count) +
+                "  |  Saved: " + std::to_string(saved_count), LIGHT_CYAN);
+            if (!_scan_message.empty()) row(_scan_message, LIGHT_YELLOW);
+            if (!_optimizer.restoration_status().empty())
+                row(_optimizer.restoration_status(),
+                    _optimizer.restoration_succeeded() ? LIGHT_GREEN : LIGHT_RED);
+            bottom_border();
+            frame_output = &std::cout;
+            present_frame(frame.str(), previous_frame);
+            redraw = false;
+        }
         if (_tray->stop_requested()) {
             _current_screen = EXIT;
             return;
@@ -691,8 +1097,62 @@ void Tui::startup_screen()
         if (window && IsIconic(window))
             ShowWindow(window, SW_HIDE);
         if (_kbhit()) {
-            std::getline(std::cin, choice);
-            break;
+            const MenuKey key = read_menu_key();
+            if (key == MenuKey::Up || key == MenuKey::Down) {
+                _home_cursor = move_tweak_cursor(_home_cursor,
+                    key == MenuKey::Up ? -1 : 1, actions.size());
+                redraw = true;
+            } else if (key == MenuKey::Back || key == MenuKey::Left) {
+                if (window) ShowWindow(window, SW_HIDE);
+            } else if (key == MenuKey::Select || key == MenuKey::Right) {
+                switch (actions[_home_cursor].first) {
+                case Action::Play:
+                    if (_optimizer.recovery_blocked()) {
+                        _scan_message = "Recovery required before optimization";
+                        redraw = true;
+                    } else if (_selected_profile.empty()) {
+                        _current_screen = CREATE_PROFILE;
+                        return;
+                    } else {
+                        _launch_path = _selected_profile_path;
+                        _attach_only = false;
+                        _current_screen = LAUNCH_GAME;
+                        return;
+                    }
+                    break;
+                case Action::Profiles:
+                    _current_screen = PROFILE_SELECT;
+                    return;
+                case Action::Windows:
+                    if (_optimizer.recovery_blocked()) {
+                        _scan_message = "Recovery required before optimization";
+                        redraw = true;
+                    } else {
+                        _launch_path.clear();
+                        _attach_only = false;
+                        _current_screen = LAUNCH_GAME;
+                        return;
+                    }
+                    break;
+                case Action::Scan:
+                    _scan_message = _optimizer.recovery_blocked() ?
+                        "Recovery required before scan" :
+                        _optimizer.scan_saved(_selected_profile_path) ?
+                        "Scan complete" : "Scan failed: " + _optimizer.saved_error();
+                    _current_screen = STARTUP;
+                    return;
+                case Action::Tray:
+                    if (window) ShowWindow(window, SW_HIDE);
+                    break;
+                case Action::Retry:
+                    _optimizer.retry_recovery();
+                    _current_screen = STARTUP;
+                    return;
+                case Action::Exit:
+                    _current_screen = EXIT;
+                    return;
+                }
+            }
         }
         const ULONGLONG now = GetTickCount64();
         if (!_optimizer.recovery_blocked() &&
@@ -708,93 +1168,95 @@ void Tui::startup_screen()
             }
             next_scan = now + 2500;
         }
-        Sleep(250);
+        wait_for_menu_key(100);
     }
-    if (choice == "r" || choice == "R") {
-        _optimizer.retry_recovery();
-    } else if (choice == "s" || choice == "S") {
-        if (_optimizer.recovery_blocked())
-            _scan_message="Recovery required before scan";
-        else
-            _scan_message=_optimizer.scan_saved(_selected_profile_path) ?
-                "Scan complete" : "Scan failed: " + _optimizer.saved_error();
-    } else if ((choice == "1" || choice == "3") &&
-               _optimizer.recovery_blocked()) {
-        // Keep the warning visible; do not start an automatic retry loop.
-    } else if (choice == "1") {
-        if (_selected_profile.empty())
-            _current_screen = CREATE_PROFILE;
-        else {
-            _launch_path = _selected_profile_path;
-            _attach_only = false;
-            _current_screen = LAUNCH_GAME;
+}
+
+bool Tui::background_apps_screen()
+{
+    bool added = false;
+    while (true) {
+        if ((_optimizer.has_game_process() || _optimizer.is_waiting_for_game()) &&
+            !_optimizer.is_game_running()) return added;
+        const auto& selected = _background_apps.selected();
+        std::vector<std::string> options;
+        for (const auto& path : selected) {
+            const auto offset = path.find_last_of("\\/");
+            const auto name = path.substr(
+                offset == std::string::npos ? 0 : offset + 1);
+            options.push_back("[x] " + name);
         }
-    } else if (choice == "2") {
-        _current_screen = PROFILE_SELECT;
-    } else if (choice == "3") {
-        _launch_path.clear();
-        _attach_only = false;
-        _current_screen = LAUNCH_GAME;
-    } else if (choice == "4") {
-        _current_screen = SETTINGS;
-    } else if (choice == "0") {
-        _current_screen = EXIT;
-    } else if (choice == "m" || choice == "M") {
-        HWND window = GetConsoleWindow();
-        if (window)
-            ShowWindow(window, SW_HIDE);
+        options.push_back("+ Running app");
+        options.push_back("+ Enter .exe path");
+        options.push_back("Back");
+        const int choice = select_menu("Close on optimize  (" +
+            std::to_string(selected.size()) + " selected)", options,
+            selected.size());
+        if (choice < 0 || static_cast<size_t>(choice) == options.size()-1)
+            return added;
+        if (static_cast<size_t>(choice) < selected.size()) {
+            const auto path = selected[static_cast<size_t>(choice)];
+            if (select_menu("Remove " + std::filesystem::path(path).filename().string() +
+                            "?", {"Keep", "Remove"}) == 1) {
+                for (size_t index = 0; index < selected.size(); ++index)
+                    if (selected[index] == path) {
+                        _background_apps.remove(index);
+                        break;
+                    }
+            }
+        } else if (static_cast<size_t>(choice) == selected.size()) {
+            const auto all = _background_apps.running();
+            std::vector<std::string> running_options;
+            for (const auto& app : all)
+                running_options.push_back("+ " + app.name + "  ~" +
+                    std::to_string(app.working_set_bytes / (1024 * 1024)) +
+                    " MB");
+            running_options.push_back("Back");
+            const int picked = select_menu("Running apps", running_options);
+            if (picked >= 0 && static_cast<size_t>(picked) < all.size()) {
+                const bool okay = _background_apps.add(all[picked].path);
+                added = added || okay;
+                if (!okay) pause("Could not add app. Press Enter...");
+            }
+        } else {
+            std::string path = read_input("App .exe:");
+            if (path.size() >= 2 && path.front() == '"' && path.back() == '"')
+                path = path.substr(1, path.size() - 2);
+            if (!path.empty()) {
+                const bool okay = _background_apps.add(path);
+                added = added || okay;
+                if (!okay) pause("Invalid or protected app. Press Enter...");
+            }
+        }
     }
 }
 
 void Tui::profiles_screen()
 {
-    clear_screen();
     const std::vector<std::string> profiles = get_profiles_list();
-    title("Profiles");
-
-    if (profiles.empty()) {
-        row("No profiles", LIGHT_YELLOW);
-    } else {
-        row("Select a profile:",BRIGHT_BLACK);
-        for (size_t i = 0; i < profiles.size(); ++i) {
-            const bool selected = profiles[i] == _selected_profile;
-            std::ostringstream item;
-            item << "[" << (i + 1) << "]  " << profiles[i];
-            if (selected) item << "   < ACTIVE";
-            row(item.str(),selected ? LIGHT_GREEN : WHITE);
-        }
+    std::vector<std::string> options;
+    size_t initial = 0;
+    for (size_t index = 0; index < profiles.size(); ++index) {
+        if (profiles[index] == _selected_profile) initial = index;
+        options.push_back(profiles[index] +
+                          (profiles[index] == _selected_profile ? "  ACTIVE" : ""));
     }
-
-    divider();
-    row("[A] Add profile",LIGHT_CYAN);
-    if (!profiles.empty())
-        row("[S] Delete profile",LIGHT_RED);
-    row("[0] Back",BRIGHT_BLACK);
-    bottom_border();
-
-    const std::string choice = read_input("Choice:");
-    if (choice == "A" || choice == "a") {
-        _current_screen = CREATE_PROFILE;
-        return;
-    }
-    if (choice == "S" || choice == "s") {
-        delete_profile_flow();
-        return;
-    }
-    if (choice == "0") {
+    options.push_back("New profile");
+    if (!profiles.empty()) options.push_back("Delete profile");
+    options.push_back("Back");
+    const int choice = select_menu("Profiles", options, initial);
+    if (choice < 0 || static_cast<size_t>(choice) == options.size() - 1) {
         _current_screen = STARTUP;
-        return;
+    } else if (static_cast<size_t>(choice) == profiles.size()) {
+        _current_screen = CREATE_PROFILE;
+    } else if (static_cast<size_t>(choice) > profiles.size()) {
+        delete_profile_flow();
+    } else {
+        _selected_profile = profiles[static_cast<size_t>(choice)];
+        _selected_profile_path = load_profile_game_path(_selected_profile);
+        _suppress_auto_attach = false;
+        _current_screen = STARTUP;
     }
-
-    try {
-        const size_t index = static_cast<size_t>(std::stoul(choice));
-        if (index >= 1 && index <= profiles.size()) {
-            _selected_profile = profiles[index - 1];
-            _selected_profile_path = load_profile_game_path(_selected_profile);
-            _suppress_auto_attach = false;
-            _current_screen = STARTUP;
-        }
-    } catch (...) {}
 }
 
 void Tui::create_profile_screen()
@@ -845,36 +1307,18 @@ void Tui::delete_profile_flow()
         _current_screen = PROFILE_SELECT;
         return;
     }
-
-    const std::string value = read_input("Profile number:");
-    try {
-        const size_t index = static_cast<size_t>(std::stoul(value));
-        if (index < 1 || index > profiles.size())
-            return;
-        const std::string confirm = read_input("Type DELETE to confirm:");
-        if (confirm == "DELETE" && delete_profile(profiles[index - 1])) {
-            if (_selected_profile == profiles[index - 1])
-                _selected_profile.clear();
+    std::vector<std::string> options(profiles.begin(), profiles.end());
+    options.push_back("Back");
+    const int choice = select_menu("Delete profile", options);
+    if (choice >= 0 && static_cast<size_t>(choice) < profiles.size()) {
+        const auto& name = profiles[static_cast<size_t>(choice)];
+        if (select_menu("Delete " + name + "?", {"Keep", "Delete"}) == 1 &&
+            delete_profile(name)) {
+            if (_selected_profile == name) _selected_profile.clear();
             select_default_profile();
-            std::cout << LIGHT_GREEN << "\n  Profile deleted.\n" << RESET;
-            pause();
         }
-    } catch (...) {}
+    }
     _current_screen = PROFILE_SELECT;
-}
-
-void Tui::optimization_info_screen()
-{
-    clear_screen();
-    title("Tweaks");
-    row("Power plan / game priority / GPU preference",WHITE);
-    row("Game Mode / capture / foreground scheduling",WHITE);
-    row("Fortnite: use NVIDIA Reflex On + Boost in-game",LIGHT_CYAN);
-    row("Temporary changes. Restored when the game closes.",BRIGHT_BLACK);
-    row("Fortnite anti-cheat is never tuned.",BRIGHT_BLACK);
-    bottom_border();
-    pause();
-    _current_screen = STARTUP;
 }
 
 void Tui::launch_current_mode()
@@ -887,6 +1331,7 @@ void Tui::launch_current_mode()
 
     if (_optimizer.scan_saved(_launch_path) &&
         _optimizer.optimize(_launch_path, !_attach_only)) {
+        _closed_apps_summary = _background_apps.close_selected(_launch_path);
         _restore_notice_sent.store(false);
         _current_screen = OPTIMIZATION_MONITOR;
         return;
@@ -916,11 +1361,23 @@ void Tui::optimization_monitor_screen()
     HWND console_window = GetConsoleWindow();
     TrayIcon& tray = *_tray;
     LatencyCapture latency;
+    CoreCpuMonitor core_cpu;
+    double peak_core_percent = 0.0;
+    enum class BenchmarkStage { Idle, BaselineWarmup, BaselineCapture,
+                                OptimizedWarmup, OptimizedCapture };
+    BenchmarkStage benchmark_stage = BenchmarkStage::Idle;
+    ULONGLONG benchmark_deadline = 0;
+    DWORD benchmark_pid = 0;
+    size_t benchmark_run = 0;
+    std::vector<PresentMonMetrics> benchmark_before, benchmark_after;
+    std::string benchmark_status;
 
     const ULONGLONG started = GetTickCount64();
     bool active = true;
     bool game_ended = false;
     bool expanded = true;
+    bool actions_focused = false;
+    size_t action_cursor = 0;
     size_t selected_category = 0;
     size_t selected_tweak = 0;
     size_t scroll = 0;
@@ -948,8 +1405,12 @@ void Tui::optimization_monitor_screen()
         if (GetConsoleScreenBufferInfo(console, &screen_info)) {
             const int height = screen_info.srWindow.Bottom -
                                screen_info.srWindow.Top + 1;
+            const bool show_apps = !_background_apps.selected().empty() ||
+                _closed_apps_summary.closed || _closed_apps_summary.skipped ||
+                _closed_apps_summary.failed;
             visible_rows=static_cast<size_t>((std::max)(1,(std::min)(8,
-                height-(tweak_message.empty() ? 22 : 23))));
+                height-(tweak_message.empty() ? 23 : 24)-
+                (show_apps ? 1 : 0))));
         }
         update_layout();
         if (expanded)
@@ -965,6 +1426,54 @@ void Tui::optimization_monitor_screen()
             continue;
         }
         latency.poll();
+        PresentMonMetrics completed{};
+        if (benchmark_stage != BenchmarkStage::Idle && latency.take_result(completed)) {
+            if (completed.state != PresentMonDataState::Valid) {
+                benchmark_status = "A/B stopped: invalid PresentMon data";
+                if (!_optimizer.is_optimized()) _optimizer.optimize(_launch_path, false);
+                benchmark_stage = BenchmarkStage::Idle;
+            } else if (benchmark_stage == BenchmarkStage::BaselineCapture) {
+                benchmark_before.push_back(completed);
+                if (!_optimizer.optimize(_launch_path, false)) {
+                    benchmark_status = "A/B stopped: session could not restart";
+                    benchmark_stage = BenchmarkStage::Idle;
+                } else {
+                    benchmark_stage = BenchmarkStage::OptimizedWarmup;
+                    benchmark_deadline = GetTickCount64() + 5000;
+                    benchmark_status = "A/B: optimized warm-up";
+                }
+            } else if (benchmark_stage == BenchmarkStage::OptimizedCapture) {
+                benchmark_after.push_back(completed);
+                ++benchmark_run;
+                if (benchmark_run >= 3) {
+                    benchmark_status = benchmark_comparison(benchmark_before, benchmark_after);
+                    save_benchmark_report(benchmark_before, benchmark_after,
+                        _optimizer.tweak_settings(), _optimizer.failed_tweaks());
+                    benchmark_stage = BenchmarkStage::Idle;
+                } else {
+                    _optimizer.restore();
+                    benchmark_stage = BenchmarkStage::BaselineWarmup;
+                    benchmark_deadline = GetTickCount64() + 5000;
+                    benchmark_status = "A/B: baseline warm-up " +
+                        std::to_string(benchmark_run + 1) + "/3";
+                }
+            }
+        }
+        if (benchmark_stage == BenchmarkStage::BaselineWarmup &&
+            GetTickCount64() >= benchmark_deadline) {
+            if (latency.start(benchmark_pid)) {
+                benchmark_stage = BenchmarkStage::BaselineCapture;
+                benchmark_status = "A/B: baseline capture " +
+                    std::to_string(benchmark_run + 1) + "/3";
+            }
+        } else if (benchmark_stage == BenchmarkStage::OptimizedWarmup &&
+                   GetTickCount64() >= benchmark_deadline) {
+            if (latency.start(benchmark_pid)) {
+                benchmark_stage = BenchmarkStage::OptimizedCapture;
+                benchmark_status = "A/B: optimized capture " +
+                    std::to_string(benchmark_run + 1) + "/3";
+            }
+        }
 
         MEMORYSTATUSEX memory{};
         memory.dwLength = sizeof(memory);
@@ -992,6 +1501,7 @@ void Tui::optimization_monitor_screen()
             previous_total = total_now;
             previous_self = self_now;
         }
+        peak_core_percent = core_cpu.sample();
 
         PROCESS_MEMORY_COUNTERS_EX own_memory{};
         own_memory.cb = sizeof(own_memory);
@@ -1008,11 +1518,14 @@ void Tui::optimization_monitor_screen()
             << std::fixed << std::setprecision(1) << used_ratio * 100.0 << "%";
         std::ostringstream cpu;
         cpu << "CPU: " << std::fixed << std::setprecision(1)
-            << (std::max)(0.0, (std::min)(100.0, cpu_percent)) << "%";
+            << (std::max)(0.0, (std::min)(100.0, cpu_percent)) << "%  |  peak core "
+            << peak_core_percent << "%";
         std::ostringstream own;
         own << "Nebula: " << std::fixed << std::setprecision(2)
             << nebula_percent << "% CPU  /  "
             << (own_memory.WorkingSetSize / (1024 * 1024)) << " MB";
+        const std::vector<Optimizer::TweakSetting> settings = _optimizer.tweak_settings();
+        const ImpactEstimate impact = estimate_impact(settings, _closed_apps_summary);
 
         std::ostringstream frame;
         frame_output = &frame;
@@ -1026,18 +1539,49 @@ void Tui::optimization_monitor_screen()
         row(own.str(),BRIGHT_BLACK);
         row(_optimizer.game_pid() ? latency.status() + "  [P] Capture 10 s" :
             "Input-to-display: no game attached", BRIGHT_BLACK);
+        if (!benchmark_status.empty()) row(benchmark_status, LIGHT_PURPLE);
+        if (box_width < 52)
+            colored_row({{"~", LIGHT_PURPLE},
+                         {std::to_string(impact.ram_mb) + "MB  ", LIGHT_CYAN},
+                         {"C+" + std::to_string(impact.cpu_percent) + "%  ", LIGHT_GREEN},
+                         {"G+" + std::to_string(impact.gpu_percent) + "%  ", LIGHT_BLUE},
+                         {"L-" + std::to_string(impact.latency_percent) + "%", LIGHT_YELLOW}});
+        else
+            colored_row({{"Gain ~  ", LIGHT_PURPLE},
+                         {"RAM " + std::to_string(impact.ram_mb) + " MB  ", LIGHT_CYAN},
+                         {"CPU +" + std::to_string(impact.cpu_percent) + "%  ", LIGHT_GREEN},
+                         {"GPU +" + std::to_string(impact.gpu_percent) + "%  ", LIGHT_BLUE},
+                         {"Latency -" + std::to_string(impact.latency_percent) + "%", LIGHT_YELLOW}});
+        const auto& apps = _closed_apps_summary;
+        const std::int64_t apps_ram_mb = apps.available_ram_delta_bytes / (1024 * 1024);
+        if (!_background_apps.selected().empty() || apps.closed ||
+            apps.skipped || apps.failed)
+            row("Apps: " + std::to_string(apps.closed) + " closed  " +
+                std::to_string(apps.skipped) + " skipped  " +
+                std::to_string(apps.failed) + " failed  |  RAM " +
+                (apps_ram_mb >= 0 ? "+" : "") + std::to_string(apps_ram_mb) +
+                " MB", apps.closed ? LIGHT_GREEN : BRIGHT_BLACK);
         divider();
-        const std::vector<Optimizer::TweakSetting> settings = _optimizer.tweak_settings();
         const ViewCounts counts=view_counts(settings);
-        colored_row({{"Applied: " + std::to_string(counts.applied),LIGHT_GREEN},
-                     {"   |   Skipped: " + std::to_string(counts.skipped),LIGHT_YELLOW},
-                     {"   |   Failed: " + std::to_string(counts.failed),LIGHT_RED}});
+        if (box_width < 52) {
+            colored_row({{"Applied " + std::to_string(counts.applied),LIGHT_GREEN},
+                         {"  Set " + std::to_string(counts.configured),LIGHT_CYAN},
+                         {"  Next " + std::to_string(counts.restart),LIGHT_PURPLE}});
+            colored_row({{"Skipped " + std::to_string(counts.skipped),LIGHT_YELLOW},
+                         {"  Failed " + std::to_string(counts.failed),LIGHT_RED}});
+        } else colored_row({{"Applied " + std::to_string(counts.applied),LIGHT_GREEN},
+                     {"  |  Set " + std::to_string(counts.configured),LIGHT_CYAN},
+                     {"  |  Next run " + std::to_string(counts.restart),LIGHT_PURPLE},
+                     {"  |  Skipped " + std::to_string(counts.skipped),LIGHT_YELLOW},
+                     {"  |  Failed " + std::to_string(counts.failed),LIGHT_RED}});
         std::vector<size_t> category_tweaks;
         if (selected_category == std::size(TWEAK_CATEGORIES)-1) {
             for (size_t n=0;n<settings.size();++n)
                 if (settings[n].durable.saved) category_tweaks.push_back(n);
         } else category_tweaks = tweaks_in_category(
             settings, TWEAK_CATEGORIES[selected_category]);
+        if (selected_category == 3)
+            category_tweaks.insert(category_tweaks.begin(), CLOSE_APPS_ROW);
         selected_tweak = move_tweak_cursor(selected_tweak, 0, category_tweaks.size());
         if (expanded) {
             carousel_y = screen_info.srWindow.Top + static_cast<SHORT>(frame_line);
@@ -1046,7 +1590,7 @@ void Tui::optimization_monitor_screen()
                 row(std::string("< ")+TWEAK_TABS[selected_category]+" >",LIGHT_PURPLE);
             } else {
                 const std::vector<std::string> tabs = box_width < 50 ?
-                    std::vector<std::string>{"C","G","R","A","I","S"} :
+                    std::vector<std::string>{"C","G","R","A","I","N","S"} :
                     std::vector<std::string>(std::begin(TWEAK_TABS),
                                              std::end(TWEAK_TABS));
                 carousel = make_carousel(tabs,box_margin+2);
@@ -1055,11 +1599,17 @@ void Tui::optimization_monitor_screen()
             for (size_t position = scroll;
                  position < category_tweaks.size() && position < scroll + visible_rows;
                  ++position) {
-                const auto& setting = settings[category_tweaks[position]];
                 const bool selected = position == selected_tweak;
-                tweak_row(setting,selected);
+                if (category_tweaks[position] == CLOSE_APPS_ROW)
+                    colored_row({{selected ? "> " : "  ",
+                                  selected ? LIGHT_PURPLE : BRIGHT_BLACK},
+                                 {"Close apps (" +
+                                  std::to_string(_background_apps.selected().size()) +
+                                  ")  [Enter]", selected ? LIGHT_PURPLE : LIGHT_CYAN}});
+                else tweak_row(settings[category_tweaks[position]],selected);
             }
-            const std::string marker=category_tweaks.empty() ? "" :
+            const std::string marker=category_tweaks.empty() ||
+                category_tweaks[selected_tweak] == CLOSE_APPS_ROW ? "" :
                 settings[category_tweaks[selected_tweak]].durable.base ?
                 "   BASE" : "";
             colored_row({{TWEAK_CATEGORIES[selected_category],LIGHT_PURPLE},
@@ -1072,28 +1622,61 @@ void Tui::optimization_monitor_screen()
         divider();
         if (!tweak_message.empty())
             row(tweak_message, LIGHT_YELLOW);
-        row(expanded ?
-            "[Left/Right] Category  [Up/Down] Tweak  [Enter] Toggle" :
-            "[L] Tweaks",WHITE);
-        if (expanded) {
-            const bool has_drift=!category_tweaks.empty() &&
-                settings[category_tweaks[selected_tweak]].durable.drift;
-            row(std::string("[S] Save/Unsave") +
-                (has_drift ? "  [R] Reapply drift" : "") +
-                "  [Esc] Hide",BRIGHT_BLACK);
+        const bool app_action = expanded && !category_tweaks.empty() &&
+            category_tweaks[selected_tweak] == CLOSE_APPS_ROW;
+        std::vector<SessionAction> actions;
+        bool selected_saved = false;
+        if (expanded && !category_tweaks.empty() && !app_action) {
+            const auto& selected = settings[category_tweaks[selected_tweak]];
+            selected_saved = selected.durable.saved;
+            if (selected.durable.eligible &&
+                (selected.enabled || selected.durable.saved))
+                actions.push_back(SessionAction::Save);
+            if (selected.durable.saved && selected.durable.drift)
+                actions.push_back(SessionAction::Reapply);
         }
-        row("[M] Hide to tray",WHITE);
-        row("[0] Stop and restore",LIGHT_RED);
+        if (_optimizer.game_pid()) {
+            actions.push_back(SessionAction::Capture);
+            actions.push_back(SessionAction::Benchmark);
+        }
+        actions.push_back(SessionAction::Tray);
+        actions.push_back(SessionAction::Stop);
+        action_cursor = (std::min)(action_cursor, actions.size()-1);
+        row(actions_focused ?
+            "J/K/H/L Action  Enter Select  Esc Tweaks" :
+            !expanded ? "Enter Open tweaks  Tab Actions" :
+            app_action ? "H/L Tabs  J/K Select  Enter Manage  Tab Actions  Esc Hide" :
+            "H/L Tabs  J/K Tweaks  Enter Toggle  Tab Actions  Esc Hide", WHITE);
+        std::vector<std::pair<std::string,const char*>> action_parts = {
+            {"ACTIONS  ", LIGHT_PURPLE}
+        };
+        if (box_width < 50) {
+            action_parts.push_back({std::string("< ") +
+                action_label(actions[action_cursor], selected_saved) + " >",
+                actions_focused ? BG_PURPLE BRIGHT_WHITE : LIGHT_CYAN});
+        } else {
+            for (size_t index=0; index<actions.size(); ++index)
+                action_parts.push_back({std::string(" ") +
+                    action_label(actions[index], selected_saved) + " ",
+                    actions_focused && index == action_cursor ?
+                    BG_PURPLE BRIGHT_WHITE : BG_BRIGHT_BLACK LIGHT_CYAN});
+        }
+        colored_row(action_parts);
         bottom_border();
         frame_output = &std::cout;
         present_frame(frame.str(),previous_frame);
 
-        for (int i = 0; i < 10 && active; ++i) {
-            Sleep(100);
+        const ULONGLONG refresh_at = GetTickCount64() + 1000;
+        while (active && GetTickCount64() < refresh_at) {
+            const DWORD remaining = static_cast<DWORD>(refresh_at - GetTickCount64());
+            const DWORD wait_ms = (std::min)(remaining, DWORD{100});
+            if (input == INVALID_HANDLE_VALUE || input == nullptr ||
+                WaitForSingleObject(input, wait_ms) == WAIT_FAILED)
+                Sleep(wait_ms);
             if (tray.stop_requested())
                 active = false;
             bool hover_changed = false;
-            if (mouse_enabled) {
+            if (input != INVALID_HANDLE_VALUE && input != nullptr) {
                 for (int event_index = 0; event_index < 32; ++event_index) {
                     INPUT_RECORD event{};
                     DWORD available = 0;
@@ -1105,7 +1688,8 @@ void Tui::optimization_monitor_screen()
                     DWORD consumed = 0;
                     if (!ReadConsoleInputA(input, &event, 1, &consumed) || !consumed)
                         break;
-                    if (!expanded || event.EventType != MOUSE_EVENT ||
+                    if (!mouse_enabled || !expanded ||
+                        event.EventType != MOUSE_EVENT ||
                         event.Event.MouseEvent.dwMousePosition.Y != carousel_y)
                         continue;
                     const int column = event.Event.MouseEvent.dwMousePosition.X;
@@ -1122,17 +1706,54 @@ void Tui::optimization_monitor_screen()
             if (hover_changed)
                 break;
             if (_kbhit()) {
-                const int key = _getch();
+                int key = _getch();
+                if (key == 9) {
+                    actions_focused = !actions_focused;
+                    break;
+                }
+                if (actions_focused) {
+                    if (key == 27 || key == 8) {
+                        actions_focused = false;
+                        break;
+                    }
+                    int direction = 0;
+                    if (key == 'j' || key == 'J' || key == 'l' || key == 'L')
+                        direction = 1;
+                    else if (key == 'k' || key == 'K' ||
+                             key == 'h' || key == 'H')
+                        direction = -1;
+                    else if (key == 0 || key == 224) {
+                        const int arrow = _getch();
+                        direction = arrow == 80 || arrow == 77 ? 1 :
+                                    arrow == 72 || arrow == 75 ? -1 : 0;
+                    }
+                    if (direction) {
+                        action_cursor = move_carousel(action_cursor,
+                                                      direction, actions.size());
+                        break;
+                    }
+                    if (key != 13) break;
+                    switch (actions[action_cursor]) {
+                    case SessionAction::Save: key = 's'; break;
+                    case SessionAction::Reapply: key = 'r'; break;
+                    case SessionAction::Capture: key = 'p'; break;
+                    case SessionAction::Benchmark: key = 'b'; break;
+                    case SessionAction::Tray: key = 'm'; break;
+                    case SessionAction::Stop: key = '0'; break;
+                    }
+                }
                 if (key == '0')
                     active = false;
-                else if (key == 'l' || key == 'L') {
-                    expanded = !expanded;
+                else if (!expanded && (key == 13 || key == 'l' || key == 'L')) {
+                    expanded = true;
                     break;
                 } else if (expanded && (key == 27 || key == 8)) {
                     expanded = false;
                     break;
                 } else if (expanded && (key == 'j' || key == 'J' ||
                                         key == 'k' || key == 'K' ||
+                                        key == 'h' || key == 'H' ||
+                                        key == 'l' || key == 'L' ||
                                         key == 0 || key == 224)) {
                     int direction = 0;
                     int category_direction = 0;
@@ -1140,6 +1761,10 @@ void Tui::optimization_monitor_screen()
                         direction = 1;
                     else if (key == 'k' || key == 'K')
                         direction = -1;
+                    else if (key == 'h' || key == 'H')
+                        category_direction = -1;
+                    else if (key == 'l' || key == 'L')
+                        category_direction = 1;
                     else {
                         const int arrow = _getch();
                         direction = arrow == 80 ? 1 : (arrow == 72 ? -1 : 0);
@@ -1160,7 +1785,32 @@ void Tui::optimization_monitor_screen()
                     }
                     break;
                 } else if (expanded && key == 13) {
-                    if (category_tweaks.empty() ||
+                    if (!category_tweaks.empty() &&
+                        category_tweaks[selected_tweak] == CLOSE_APPS_ROW) {
+                        SetConsoleCursorInfo(console, &original_cursor);
+                        if (mouse_enabled)
+                            SetConsoleMode(input, original_input_mode &
+                                                  ~ENABLE_MOUSE_INPUT &
+                                                  ~ENABLE_QUICK_EDIT_MODE);
+                        const bool added = background_apps_screen();
+                        if (mouse_enabled)
+                            SetConsoleMode(input, (original_input_mode |
+                                ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS) &
+                                ~ENABLE_QUICK_EDIT_MODE);
+                        SetConsoleCursorInfo(console, &hidden_cursor);
+                        if (added &&
+                            ((!_optimizer.has_game_process() &&
+                              !_optimizer.is_waiting_for_game()) ||
+                             _optimizer.is_game_running())) {
+                            const auto result = _background_apps.close_selected(_launch_path);
+                            _closed_apps_summary.closed += result.closed;
+                            _closed_apps_summary.skipped += result.skipped;
+                            _closed_apps_summary.failed += result.failed;
+                            _closed_apps_summary.available_ram_delta_bytes +=
+                                result.available_ram_delta_bytes;
+                        }
+                        previous_frame.clear();
+                    } else if (category_tweaks.empty() ||
                         !_optimizer.toggle_tweak(category_tweaks[selected_tweak])) {
                         tweak_message = "Could not save tweak settings";
                     } else if (_optimizer.is_waiting_for_game()) {
@@ -1180,6 +1830,9 @@ void Tui::optimization_monitor_screen()
                                         key == 'r' || key == 'R')) {
                     if (category_tweaks.empty()) { tweak_message="No tweak selected"; break; }
                     const size_t index=category_tweaks[selected_tweak];
+                    if (index == CLOSE_APPS_ROW) {
+                        tweak_message="Press Enter to manage apps"; break;
+                    }
                     const auto& item=settings[index];
                     const bool reapply=key=='r' || key=='R';
                     if (!item.durable.eligible || (!item.enabled && !item.durable.saved)) {
@@ -1193,12 +1846,16 @@ void Tui::optimization_monitor_screen()
                             "Unsaved; Windows value kept" : "Could not unsave";
                         break;
                     }
-                    const bool sensitive=index==28 || index==37 || index==39 || index==40;
+                    const bool sensitive=index==28 || index==37 || index==39 ||
+                        index==40 || index==41 || index==44 ||
+                        (index>=47 && index<=50) || index==54 || index==55 ||
+                        index==57 || index==58 || index==59;
                     bool confirmed=!sensitive;
                     if (sensitive) {
-                        std::cout << "\nSave this setting permanently? [Y/N] " << std::flush;
-                        const int answer=_getch();
-                        confirmed=answer=='y' || answer=='Y';
+                        SetConsoleCursorInfo(console, &original_cursor);
+                        confirmed=select_menu("Save permanently?",
+                                              {"Cancel", "Save"}) == 1;
+                        SetConsoleCursorInfo(console, &hidden_cursor);
                         previous_frame.clear();
                     }
                     if (!confirmed) { tweak_message="Cancelled"; break; }
@@ -1220,6 +1877,22 @@ void Tui::optimization_monitor_screen()
                     break;
                 } else if (key == 'p' || key == 'P') {
                     latency.start(_optimizer.game_pid());
+                    break;
+                } else if ((key == 'b' || key == 'B') &&
+                           benchmark_stage == BenchmarkStage::Idle) {
+                    if (_launch_path.empty() || !_optimizer.game_pid()) {
+                        benchmark_status = "A/B needs an active game profile";
+                        break;
+                    }
+                    PresentMonMetrics stale{};
+                    latency.take_result(stale);
+                    benchmark_pid = _optimizer.game_pid();
+                    benchmark_run = 0;
+                    benchmark_before.clear(); benchmark_after.clear();
+                    _optimizer.restore();
+                    benchmark_stage = BenchmarkStage::BaselineWarmup;
+                    benchmark_deadline = GetTickCount64() + 5000;
+                    benchmark_status = "A/B: baseline warm-up 1/3";
                     break;
                 } else if ((key == 'm' || key == 'M') && console_window) {
                     ShowWindow(console_window, SW_HIDE);
@@ -1246,7 +1919,6 @@ void Tui::run()
         case STARTUP: startup_screen(); break;
         case PROFILE_SELECT: profiles_screen(); break;
         case CREATE_PROFILE: create_profile_screen(); break;
-        case SETTINGS: optimization_info_screen(); break;
         case LAUNCH_GAME: launch_current_mode(); break;
         case OPTIMIZATION_MONITOR: optimization_monitor_screen(); break;
         case EXIT:

@@ -3,7 +3,6 @@
 #include "tui_colors.hpp"
 #include "json.hpp"
 #include "optimizer.hpp"
-# define PROFILES_DIR "config/profiles/"
 
 using json = nlohmann::json;
 

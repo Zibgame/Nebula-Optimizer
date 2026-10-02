@@ -20,11 +20,21 @@ int main()
     {
         Optimizer optimizer;
         const auto settings = optimizer.tweak_settings();
-        okay = settings.size() == 41 && settings.front().enabled &&
+        okay = settings.size() == 60 && settings.front().enabled &&
                !settings[15].enabled && settings[23].enabled &&
                !settings[24].enabled && settings[36].enabled &&
                !settings[37].enabled && settings[38].enabled &&
                !settings[39].enabled && !settings[40].enabled &&
+               !settings[41].enabled && !settings[42].enabled &&
+               !settings[43].enabled && !settings[44].enabled &&
+               settings[45].enabled && settings[46].enabled &&
+               !settings[47].enabled && !settings[48].enabled &&
+               !settings[49].enabled && !settings[50].enabled &&
+               settings[51].enabled && settings[52].enabled &&
+               settings[53].enabled && !settings[54].enabled &&
+               !settings[55].enabled && settings[56].enabled &&
+               !settings[57].enabled && !settings[58].enabled &&
+               !settings[59].enabled &&
                settings[36].category == "Memory";
         okay = optimizer.toggle_tweak(0) && okay;
         okay = optimizer.toggle_tweak(36) && okay;

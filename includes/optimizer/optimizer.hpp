@@ -7,11 +7,12 @@
 #include <memory>
 #include <windows.h>
 #include "saved_tweaks.hpp"
+#include "tweak_catalog.hpp"
 
 class Optimizer {
 public:
     enum class TweakStatus {
-        Off, On, Applied, Skipped, AlreadyConfigured,
+        Off, On, Applied, Configured, RestartRequired, Skipped, AlreadyConfigured,
         Unsupported, AccessDenied, Failed, RestoreIncomplete
     };
     struct TweakSetting {
@@ -83,6 +84,7 @@ private:
         bool compare_and_swap;
         DWORD applied_priority_class;
         DWORD applied_throttling_state;
+        DWORD applied_throttling_control;
         DWORD applied_memory_priority;
         bool applied_boost_disabled;
     };
@@ -101,6 +103,10 @@ private:
         DWORD width;
         DWORD height;
         DWORD bits_per_pel;
+        DWORD orientation;
+        DWORD fixed_output;
+        LONG position_x;
+        LONG position_y;
         DWORD applied_frequency;
     };
 
@@ -114,6 +120,45 @@ private:
         bool filter_touched = false;
         bool sticky_touched = false;
         bool toggle_touched = false;
+    };
+
+    struct InputTuningState {
+        FILTERKEYS filter{};
+        FILTERKEYS filter_applied{};
+        bool filter_touched = false;
+        UINT delay = 0;
+        UINT delay_applied = 0;
+        bool delay_touched = false;
+        UINT speed = 0;
+        UINT speed_applied = 0;
+        bool speed_touched = false;
+        std::array<int, 3> mouse{};
+        std::array<int, 3> mouse_applied{};
+        bool mouse_touched = false;
+    };
+
+    struct AdvancedProcessState {
+        DWORD pid = 0;
+        ULONGLONG created_at = 0;
+        std::vector<ULONG> cpu_sets;
+        ULONG io_priority = 0;
+        ULONG applied_io_priority = 0;
+        bool cpu_sets_touched = false;
+        bool io_touched = false;
+    };
+
+    struct ServiceState {
+        std::string name;
+        DWORD original_state = SERVICE_STOPPED;
+        DWORD applied_state = SERVICE_STOPPED;
+        bool touched = false;
+    };
+
+    struct DnsState {
+        GUID interface_id{};
+        std::wstring original;
+        std::wstring applied;
+        bool touched = false;
     };
 
     bool snapshot_registry(HKEY root, const char* path, const char* name,
@@ -136,10 +181,23 @@ private:
     bool restore_ac_power_settings();
     bool begin_session_power_plan();
     bool restore_session_power_plan();
-    void optimize_display_refresh();
+    void optimize_display_refresh(DWORD game_pid = 0);
     bool restore_display();
     void optimize_accessibility_hotkeys();
     bool restore_accessibility_hotkeys();
+    void optimize_input_tuning();
+    bool restore_input_tuning();
+    void optimize_advanced_session();
+    void tune_advanced_game_process(HANDLE process, DWORD pid);
+    void tune_background_io();
+    bool restore_advanced_processes();
+    bool restore_services();
+    bool pause_service(const char* name, size_t tweak);
+    void request_timer_resolution();
+    void release_timer_resolution();
+    bool start_recovery_watchdog();
+    void optimize_network(bool may_restart);
+    bool restore_network();
     void tune_game_process(HANDLE process, bool tracked);
     void set_status(size_t index, TweakStatus status);
     void record(bool success, const char* label);
@@ -163,6 +221,14 @@ private:
     std::vector<PowerSettingState> _power_settings;
     DisplayState _display_state{};
     AccessibilityState _accessibility_state{};
+    InputTuningState _input_tuning_state{};
+    std::vector<AdvancedProcessState> _advanced_processes;
+    std::vector<ServiceState> _service_states;
+    DnsState _dns_state{};
+    std::string _network_device_instance;
+    bool _network_restart_needed = false;
+    bool _timer_resolution_active = false;
+    bool _watchdog_started = false;
     std::vector<std::string> _applied;
     std::vector<std::string> _failed;
     std::string _last_error;
@@ -170,8 +236,8 @@ private:
     std::string _journal_path;
     std::string _preferences_path;
     std::unique_ptr<SavedTweaks> _saved_tweaks;
-    std::array<bool, 41> _tweaks_enabled;
-    std::array<TweakStatus, 41> _tweak_status;
+    std::array<bool, TWEAK_COUNT> _tweaks_enabled;
+    std::array<TweakStatus, TWEAK_COUNT> _tweak_status;
     bool _recovery_failed;
     bool _restoration_succeeded;
     mutable std::recursive_mutex _state_mutex;

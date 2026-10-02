@@ -1,3 +1,4 @@
+#include <winsock2.h>
 #include "optimizer.hpp"
 
 #include <algorithm>
@@ -13,66 +14,36 @@
 #include <shlobj.h>
 #include <powrprof.h>
 #include <objbase.h>
+#include <winsvc.h>
+#include <iphlpapi.h>
+#include <ws2tcpip.h>
+#include <cfgmgr32.h>
+#include <chrono>
+#include <cwctype>
 #include "json.hpp"
+#include "power_qos.hpp"
 
 namespace {
+
+struct GameWindowSearch { DWORD pid; HWND window; LONG area; };
+BOOL CALLBACK find_game_window(HWND window, LPARAM value)
+{
+    auto& search = *reinterpret_cast<GameWindowSearch*>(value);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (pid != search.pid || !IsWindowVisible(window) || GetWindow(window, GW_OWNER))
+        return TRUE;
+    RECT bounds{};
+    if (!GetWindowRect(window, &bounds)) return TRUE;
+    const LONG area = (bounds.right - bounds.left) * (bounds.bottom - bounds.top);
+    if (area > search.area) { search.area = area; search.window = window; }
+    return TRUE;
+}
 
 constexpr const char* MMCSS_PROFILE =
     "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile";
 constexpr const char* MMCSS_GAMES =
     "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games";
-constexpr const char* TWEAK_IDS[41] = {
-    "power_plan", "prevent_sleep", "game_dvr", "background_capture",
-    "game_bar_popup", "game_mode", "mmcss_network", "mmcss_reserve",
-    "mmcss_priority", "mmcss_scheduling", "foreground_cpu",
-    "background_onedrive", "gpu_preference", "game_ecoqos", "game_priority",
-    "game_bar_controller", "recording_hotkey", "history_hotkey",
-    "game_bar_hotkey", "background_indexer", "background_widgets",
-    "background_phone_link", "background_adobe", "ac_cpu_epp",
-    "ac_pcie_aspm", "ac_cpu_boost", "game_dynamic_boost",
-    "game_memory_normal", "display_max_refresh", "memory_cloud",
-    "memory_indexer", "memory_widgets", "memory_phone_link",
-    "memory_adobe", "updater_cpu", "updater_ecoqos",
-    "updater_memory", "ac_core_parking", "ac_wifi_performance",
-    "diagnostic_usb_suspend", "accessibility_hotkeys"
-};
-constexpr const char* TWEAK_LABELS[41] = {
-    "Temporary session power plan", "Prevent sleep while gaming",
-    "Disable Game DVR", "Disable background capture",
-    "Hide Game Bar startup popup", "Enable Windows Game Mode",
-    "Remove MMCSS network throttle", "MMCSS reserve: 10%",
-    "MMCSS game priority", "MMCSS game scheduling",
-    "Favor foreground CPU", "Reduce cloud sync priority",
-    "Prefer high-performance GPU", "Disable game EcoQoS",
-    "High game CPU priority", "Disable controller Game Bar shortcut",
-    "Disable recording hotkey", "Disable replay hotkey",
-    "Disable Game Bar hotkey", "Reduce search indexing priority",
-    "Reduce Widgets priority", "Reduce Phone Link priority",
-    "Reduce Adobe helper priority", "AC CPU performance preference",
-    "AC PCIe link power saving off", "AC CPU boost mode",
-    "Game dynamic priority boost", "Game memory priority normal",
-    "Highest display refresh rate", "Cloud sync memory priority",
-    "Indexer memory priority", "Widgets memory priority",
-    "Phone Link memory priority", "Adobe memory priority",
-    "Updater CPU priority", "Updater EcoQoS",
-    "Updater memory priority", "[Exp] Core parking off",
-    "AC Wi-Fi performance", "[Diag] USB selective suspend off",
-    "Accessibility hotkeys off"
-};
-constexpr const char* TWEAK_CATEGORIES[41] = {
-    "CPU & Power", "CPU & Power", "Input & Capture", "Input & Capture",
-    "Input & Capture", "CPU & Power", "Background", "CPU & Power",
-    "CPU & Power", "CPU & Power", "CPU & Power", "Background",
-    "GPU & Display", "CPU & Power", "CPU & Power",
-    "Input & Capture", "Input & Capture", "Input & Capture",
-    "Input & Capture", "Background", "Background", "Background",
-    "Background", "CPU & Power", "GPU & Display",
-    "CPU & Power", "CPU & Power", "Memory", "GPU & Display",
-    "Memory", "Memory", "Memory", "Memory", "Memory",
-    "Background", "Background", "Memory",
-    "CPU & Power", "CPU & Power", "Input & Capture", "Input & Capture"
-};
-
 size_t tweak_index_for_label(const char* label)
 {
     struct Match { const char* label; size_t index; };
@@ -96,7 +67,10 @@ size_t tweak_index_for_label(const char* label)
     for (const Match& match : matches)
         if (std::strcmp(match.label, label) == 0)
             return match.index;
-    return 41;
+    for (size_t index = 0; index < TWEAK_CATALOG.size(); ++index)
+        if (std::strcmp(TWEAK_CATALOG[index].label, label) == 0)
+            return index;
+    return TWEAK_COUNT;
 }
 
 constexpr GUID CPU_EPP = {0x36687f9e, 0xe3a5, 0x4dbf,
@@ -109,6 +83,8 @@ constexpr GUID PCIE_SUBGROUP = {0x501a4d13, 0x42af, 0x4429,
                                 {0x9f, 0xd1, 0xa8, 0x21, 0x8c, 0x26, 0x8e, 0x20}};
 constexpr GUID CPU_BOOST = {0xbe337238, 0x0d82, 0x4146,
                             {0xa9, 0x60, 0x4f, 0x37, 0x49, 0xd4, 0x70, 0xc7}};
+constexpr GUID CPU_MINIMUM = {0x893dee8e, 0x2bef, 0x41e0,
+                              {0x89, 0xc6, 0xb5, 0x5d, 0x09, 0x29, 0x96, 0x4c}};
 constexpr GUID CORE_PARKING = {0x0cc5b647, 0xc1df, 0x4637,
                                {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x83}};
 constexpr GUID CORE_PARKING_1 = {0x0cc5b647, 0xc1df, 0x4637,
@@ -126,7 +102,8 @@ constexpr GUID HIGH_PERFORMANCE_SCHEME = {0x8c5e7fda, 0xe8bf, 0x4a96,
 
 const GUID* power_subgroup(unsigned int kind)
 {
-    return kind == 0 || kind == 2 || kind == 3 || kind == 4 ? &CPU_SUBGROUP :
+    return kind == 0 || kind == 2 || kind == 3 || kind == 4 || kind == 7 ?
+           &CPU_SUBGROUP :
            kind == 1 ? &PCIE_SUBGROUP :
            kind == 5 ? &WIFI_SUBGROUP :
            kind == 6 ? &USB_SUBGROUP : nullptr;
@@ -137,7 +114,7 @@ const GUID* power_setting(unsigned int kind)
     return kind == 0 ? &CPU_EPP : kind == 1 ? &PCIE_ASPM :
            kind == 2 ? &CPU_BOOST : kind == 3 ? &CORE_PARKING :
            kind == 4 ? &CORE_PARKING_1 : kind == 5 ? &WIFI_POWER :
-           kind == 6 ? &USB_SUSPEND : nullptr;
+           kind == 6 ? &USB_SUSPEND : kind == 7 ? &CPU_MINIMUM : nullptr;
 }
 
 std::string guid_text(const GUID& guid)
@@ -260,6 +237,327 @@ ULONGLONG filetime_ticks(const FILETIME& time)
            time.dwLowDateTime;
 }
 
+struct ActiveAdapterInfo {
+    GUID id{};
+    DWORD index = 0;
+    ULONG type = 0;
+    std::string registry_path;
+    std::string device_instance;
+};
+
+struct DnsInterfaceSettingsV1 {
+    ULONG Version;
+    ULONG64 Flags;
+    PWSTR Domain;
+    PWSTR NameServer;
+    PWSTR SearchList;
+    ULONG RegistrationEnabled;
+    ULONG RegisterAdapterName;
+    ULONG EnableLLMNR;
+    ULONG QueryAdapterName;
+    PWSTR ProfileNameServer;
+};
+using GetInterfaceDnsSettingsFn = DWORD (WINAPI*)(GUID, DnsInterfaceSettingsV1*);
+using SetInterfaceDnsSettingsFn = DWORD (WINAPI*)(GUID, const DnsInterfaceSettingsV1*);
+using FreeInterfaceDnsSettingsFn = VOID (WINAPI*)(DnsInterfaceSettingsV1*);
+constexpr ULONG DNS_INTERFACE_SETTINGS_VERSION_1 = 1;
+constexpr ULONG64 DNS_SETTING_NAME_SERVER = 0x0002;
+
+template<class Function>
+Function load_ip_helper(const char* name)
+{
+    HMODULE module = GetModuleHandleA("iphlpapi.dll");
+    if (!module) module = LoadLibraryA("iphlpapi.dll");
+    FARPROC address = module ? GetProcAddress(module, name) : nullptr;
+    Function function = nullptr;
+    static_assert(sizeof(function) == sizeof(address));
+    std::memcpy(&function, &address, sizeof(function));
+    return function;
+}
+
+std::string narrow_utf8(const std::wstring& value)
+{
+    if (value.empty()) return {};
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, value.c_str(),
+                                          static_cast<int>(value.size()),
+                                          nullptr, 0, nullptr, nullptr);
+    std::string result(bytes, '\0');
+    if (bytes) WideCharToMultiByte(CP_UTF8, 0, value.c_str(),
+                                   static_cast<int>(value.size()), result.data(),
+                                   bytes, nullptr, nullptr);
+    return result;
+}
+
+std::wstring widen_utf8(const std::string& value)
+{
+    if (value.empty()) return {};
+    const int chars = MultiByteToWideChar(CP_UTF8, 0, value.c_str(),
+                                          static_cast<int>(value.size()),
+                                          nullptr, 0);
+    std::wstring result(chars, L'\0');
+    if (chars) MultiByteToWideChar(CP_UTF8, 0, value.c_str(),
+                                   static_cast<int>(value.size()), result.data(),
+                                   chars);
+    return result;
+}
+
+bool dns_api(GetInterfaceDnsSettingsFn& get, SetInterfaceDnsSettingsFn& set,
+             FreeInterfaceDnsSettingsFn& release)
+{
+    get = load_ip_helper<GetInterfaceDnsSettingsFn>("GetInterfaceDnsSettings");
+    set = load_ip_helper<SetInterfaceDnsSettingsFn>("SetInterfaceDnsSettings");
+    release = load_ip_helper<FreeInterfaceDnsSettingsFn>("FreeInterfaceDnsSettings");
+    return get && set && release;
+}
+
+std::wstring current_dns_servers(const GUID& id)
+{
+    GetInterfaceDnsSettingsFn get = nullptr;
+    SetInterfaceDnsSettingsFn set = nullptr;
+    FreeInterfaceDnsSettingsFn release = nullptr;
+    if (!dns_api(get, set, release)) return {};
+    DnsInterfaceSettingsV1 settings{};
+    settings.Version = DNS_INTERFACE_SETTINGS_VERSION_1;
+    if (get(id, &settings) != NO_ERROR) return {};
+    const std::wstring result = settings.NameServer ? settings.NameServer : L"";
+    release(&settings);
+    return result;
+}
+
+bool set_dns_servers(const GUID& id, const std::wstring& servers)
+{
+    GetInterfaceDnsSettingsFn get = nullptr;
+    SetInterfaceDnsSettingsFn set = nullptr;
+    FreeInterfaceDnsSettingsFn release = nullptr;
+    if (!dns_api(get, set, release)) return false;
+    DnsInterfaceSettingsV1 settings{};
+    settings.Version = DNS_INTERFACE_SETTINGS_VERSION_1;
+    settings.Flags = DNS_SETTING_NAME_SERVER;
+    settings.NameServer = servers.empty() ? nullptr :
+        const_cast<PWSTR>(servers.c_str());
+    return set(id, &settings) == NO_ERROR;
+}
+
+bool same_dns_servers(const std::wstring& left, const std::wstring& right)
+{
+    auto normalize = [](const std::wstring& input) {
+        std::wstring output;
+        bool separator = false;
+        for (wchar_t character : input) {
+            if (character == L',' || character == L';' || iswspace(character)) {
+                separator = !output.empty();
+            } else {
+                if (separator && output.back() != L',') output.push_back(L',');
+                separator = false;
+                output.push_back(static_cast<wchar_t>(towlower(character)));
+            }
+        }
+        while (!output.empty() && output.back() == L',') output.pop_back();
+        return output;
+    };
+    return normalize(left) == normalize(right);
+}
+
+int dns_latency_ms(const char* server)
+{
+    sockaddr_in target{};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(53);
+    if (inet_pton(AF_INET, server, &target.sin_addr) != 1) return -1;
+    std::vector<int> samples;
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        SOCKET socket_handle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (socket_handle == INVALID_SOCKET) break;
+        DWORD timeout = 700;
+        setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        unsigned char query[64]{};
+        const USHORT id = static_cast<USHORT>((GetTickCount() + attempt * 7919) & 0xffff);
+        query[0] = static_cast<unsigned char>(id >> 8); query[1] = static_cast<unsigned char>(id);
+        query[2] = 1; query[5] = 1;
+        size_t position = 12;
+        for (const char* label : {"www", "epicgames", "com"}) {
+            const size_t length = std::strlen(label);
+            query[position++] = static_cast<unsigned char>(length);
+            std::memcpy(query + position, label, length); position += length;
+        }
+        query[position++] = 0; query[position++] = 0; query[position++] = 1;
+        query[position++] = 0; query[position++] = 1;
+        const auto start = std::chrono::steady_clock::now();
+        const int sent = sendto(socket_handle,
+            reinterpret_cast<const char*>(query), static_cast<int>(position), 0,
+            reinterpret_cast<const sockaddr*>(&target), sizeof(target));
+        unsigned char response[512]{}; sockaddr_in from{}; int from_size = sizeof(from);
+        const int received = sent > 0 ? recvfrom(socket_handle,
+            reinterpret_cast<char*>(response), sizeof(response), 0,
+            reinterpret_cast<sockaddr*>(&from), &from_size) : -1;
+        const auto stop = std::chrono::steady_clock::now();
+        closesocket(socket_handle);
+        if (received >= 12 && response[0] == query[0] && response[1] == query[1])
+            samples.push_back(static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(stop-start).count()));
+    }
+    if (samples.size() < 2) return -1;
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size()/2];
+}
+
+bool read_registry_string(HKEY root, const std::string& path,
+                          const char* name, std::string& value)
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExA(root, path.c_str(), 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return false;
+    DWORD type = 0, bytes = 0;
+    LONG result = RegQueryValueExA(key, name, nullptr, &type, nullptr, &bytes);
+    if (result != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
+        RegCloseKey(key); return false;
+    }
+    std::vector<char> buffer(bytes + 1, 0);
+    result = RegQueryValueExA(key, name, nullptr, &type,
+                             reinterpret_cast<BYTE*>(buffer.data()), &bytes);
+    RegCloseKey(key);
+    if (result != ERROR_SUCCESS) return false;
+    value.assign(buffer.data());
+    return true;
+}
+
+bool active_adapter(ActiveAdapterInfo& out)
+{
+    IPAddr destination = inet_addr("1.1.1.1");
+    if (GetBestInterface(destination, &out.index) != NO_ERROR)
+        return false;
+    ULONG bytes = 0;
+    GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, nullptr, &bytes);
+    std::vector<unsigned char> storage(bytes);
+    auto* first = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(storage.data());
+    if (!bytes || GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX,
+                                       nullptr, first, &bytes) != NO_ERROR)
+        return false;
+    std::string adapter_name;
+    for (auto* item = first; item; item = item->Next) {
+        if (item->IfIndex == out.index || item->Ipv6IfIndex == out.index) {
+            adapter_name = item->AdapterName ? item->AdapterName : "";
+            out.type = item->IfType;
+            break;
+        }
+    }
+    if (adapter_name.empty()) return false;
+    std::wstring wide(adapter_name.begin(), adapter_name.end());
+    if (wide.empty() || wide.front() != L'{') wide = L"{" + wide + L"}";
+    if (CLSIDFromString(wide.c_str(), &out.id) != S_OK) return false;
+
+    const std::string base =
+        "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}";
+    HKEY root = nullptr;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, base.c_str(), 0,
+                      KEY_ENUMERATE_SUB_KEYS, &root) != ERROR_SUCCESS)
+        return false;
+    for (DWORD number = 0;; ++number) {
+        char name[256]{}; DWORD length = sizeof(name);
+        if (RegEnumKeyExA(root, number, name, &length, nullptr, nullptr,
+                          nullptr, nullptr) != ERROR_SUCCESS)
+            break;
+        const std::string path = base + "\\" + name;
+        std::string id;
+        if (read_registry_string(HKEY_LOCAL_MACHINE, path,
+                                 "NetCfgInstanceId", id) &&
+            _stricmp(id.c_str(), adapter_name.c_str()) == 0) {
+            out.registry_path = path;
+            read_registry_string(HKEY_LOCAL_MACHINE, path,
+                                 "PnPInstanceID", out.device_instance);
+            break;
+        }
+    }
+    RegCloseKey(root);
+    return !out.registry_path.empty();
+}
+
+std::string effective_dns_server(DWORD interface_index)
+{
+    ULONG bytes = 0;
+    GetAdaptersAddresses(AF_UNSPEC, 0, nullptr, nullptr, &bytes);
+    std::vector<unsigned char> storage(bytes);
+    auto* first = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(storage.data());
+    if (!bytes || GetAdaptersAddresses(AF_UNSPEC, 0, nullptr, first, &bytes) != NO_ERROR)
+        return {};
+    for (auto* item = first; item; item = item->Next) {
+        if (item->IfIndex != interface_index && item->Ipv6IfIndex != interface_index)
+            continue;
+        for (auto* dns = item->FirstDnsServerAddress; dns; dns = dns->Next) {
+            if (!dns->Address.lpSockaddr ||
+                dns->Address.lpSockaddr->sa_family != AF_INET) continue;
+            char host[NI_MAXHOST]{};
+            if (getnameinfo(dns->Address.lpSockaddr,
+                            static_cast<socklen_t>(dns->Address.iSockaddrLength),
+                            host, sizeof(host), nullptr, 0, NI_NUMERICHOST) == 0)
+                return host;
+        }
+    }
+    return {};
+}
+
+std::string lower_ascii(std::string text)
+{
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return text;
+}
+
+bool driver_enum_value(const ActiveAdapterInfo& adapter, const char* keyword,
+                       const std::vector<std::string>& wanted,
+                       DWORD& type, std::string& string_value, DWORD& dword_value)
+{
+    const std::string enum_path = adapter.registry_path +
+        "\\Ndi\\Params\\" + keyword + "\\enum";
+    HKEY values = nullptr;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, enum_path.c_str(), 0,
+                      KEY_QUERY_VALUE, &values) != ERROR_SUCCESS)
+        return false;
+    bool found = false;
+    for (DWORD index = 0; !found; ++index) {
+        char name[128]{}; DWORD name_size = sizeof(name);
+        BYTE data[512]{}; DWORD data_size = sizeof(data), data_type = 0;
+        if (RegEnumValueA(values, index, name, &name_size, nullptr, &data_type,
+                          data, &data_size) != ERROR_SUCCESS)
+            break;
+        if (data_type != REG_SZ) continue;
+        const std::string display = lower_ascii(reinterpret_cast<char*>(data));
+        for (const std::string& token : wanted) {
+            if (display.find(lower_ascii(token)) != std::string::npos) {
+                string_value.assign(name, name_size);
+                dword_value = std::strtoul(string_value.c_str(), nullptr, 0);
+                found = true; break;
+            }
+        }
+    }
+    RegCloseKey(values);
+    if (!found) return false;
+    HKEY adapter_key = nullptr;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, adapter.registry_path.c_str(), 0,
+                      KEY_QUERY_VALUE, &adapter_key) != ERROR_SUCCESS)
+        return false;
+    DWORD size = 0;
+    const LONG result = RegQueryValueExA(adapter_key, keyword, nullptr,
+                                         &type, nullptr, &size);
+    RegCloseKey(adapter_key);
+    return result == ERROR_SUCCESS && (type == REG_SZ || type == REG_DWORD);
+}
+
+bool restart_adapter_device(const std::string& instance)
+{
+    if (instance.empty()) return false;
+    std::vector<char> text(instance.begin(), instance.end());
+    text.push_back('\0');
+    DEVINST device = 0;
+    if (CM_Locate_DevNodeA(&device, text.data(), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS)
+        return false;
+    if (CM_Disable_DevNode(device, 0) != CR_SUCCESS)
+        return false;
+    Sleep(300);
+    return CM_Enable_DevNode(device, 0) == CR_SUCCESS;
+}
+
 } // namespace
 
 Optimizer::Optimizer()
@@ -273,18 +571,14 @@ Optimizer::Optimizer()
       _recovery_failed(false),
       _restoration_succeeded(false)
 {
-    _tweaks_enabled.fill(true);
-    for (size_t index = 15; index <= 18; ++index)
-        _tweaks_enabled[index] = false;
-    _tweaks_enabled[24] = false;
-    _tweaks_enabled[37] = false;
-    _tweaks_enabled[39] = false;
-    _tweaks_enabled[40] = false;
+    for (size_t index = 0; index < TWEAK_COUNT; ++index)
+        _tweaks_enabled[index] = TWEAK_CATALOG[index].default_enabled;
     _tweak_status.fill(TweakStatus::On);
     _saved_power_plan_guid[0] = '\0';
     char local_app_data[MAX_PATH]{};
-    if (GetEnvironmentVariableA("LOCALAPPDATA", local_app_data,
-                                sizeof(local_app_data))) {
+    const DWORD app_data_length = GetEnvironmentVariableA(
+        "LOCALAPPDATA", local_app_data, sizeof(local_app_data));
+    if (app_data_length && app_data_length < sizeof(local_app_data)) {
         _journal_path = std::string(local_app_data) +
                         "\\NebulaOptimizer\\session-journal.json";
         _preferences_path = std::string(local_app_data) +
@@ -322,8 +616,9 @@ std::vector<Optimizer::TweakSetting> Optimizer::tweak_settings() const
 {
     const std::lock_guard<std::recursive_mutex> lock(_state_mutex);
     std::vector<TweakSetting> result;
+    result.reserve(_tweaks_enabled.size());
     for (size_t index = 0; index < _tweaks_enabled.size(); ++index)
-        result.push_back({TWEAK_LABELS[index], TWEAK_CATEGORIES[index],
+        result.push_back({TWEAK_CATALOG[index].label, TWEAK_CATALOG[index].category,
                           _tweaks_enabled[index], _tweak_status[index],
                           _saved_tweaks ? _saved_tweaks->info(index) : SavedTweaks::Info{}});
     return result;
@@ -339,10 +634,15 @@ void Optimizer::load_preferences()
             return;
         nlohmann::json settings;
         file >> settings;
+        const unsigned version = settings.value("_catalog_version", 1u);
         for (size_t index = 0; index < _tweaks_enabled.size(); ++index)
-            if (settings.contains(TWEAK_IDS[index]) &&
-                settings[TWEAK_IDS[index]].is_boolean())
-                _tweaks_enabled[index] = settings[TWEAK_IDS[index]].get<bool>();
+            if (settings.contains(TWEAK_CATALOG[index].id) &&
+                settings[TWEAK_CATALOG[index].id].is_boolean())
+                _tweaks_enabled[index] = settings[TWEAK_CATALOG[index].id].get<bool>();
+        if (version < 2)
+            for (size_t index = 6; index <= 10; ++index)
+                _tweaks_enabled[index] = false;
+        if (version < 2) save_preferences();
     } catch (...) {}
 }
 
@@ -352,8 +652,9 @@ bool Optimizer::save_preferences() const
         return false;
     try {
         nlohmann::json settings;
+        settings["_catalog_version"] = 2;
         for (size_t index = 0; index < _tweaks_enabled.size(); ++index)
-            settings[TWEAK_IDS[index]] = _tweaks_enabled[index];
+            settings[TWEAK_CATALOG[index].id] = _tweaks_enabled[index];
         std::filesystem::create_directories(
             std::filesystem::path(_preferences_path).parent_path());
         const std::string temporary = _preferences_path + ".tmp";
@@ -430,6 +731,30 @@ void Optimizer::record(bool success, const char* label)
                success ? TweakStatus::Applied : TweakStatus::Failed);
 }
 
+bool Optimizer::start_recovery_watchdog()
+{
+    if (_watchdog_started) return true;
+    char executable[MAX_PATH * 4]{};
+    if (!GetModuleFileNameA(nullptr, executable, sizeof(executable))) return false;
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return false;
+    const ULONGLONG identity = filetime_ticks(created);
+    const std::string command = std::string("\"") + executable +
+        "\" --watchdog " + std::to_string(GetCurrentProcessId()) + " " +
+        std::to_string(identity);
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+    STARTUPINFOA startup{}; startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child{};
+    const BOOL started = CreateProcessA(executable, mutable_command.data(), nullptr,
+        nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child);
+    if (!started) return false;
+    CloseHandle(child.hThread);
+    CloseHandle(child.hProcess);
+    _watchdog_started = true;
+    return true;
+}
+
 void Optimizer::set_status(size_t index, TweakStatus status)
 {
     if (index >= _tweak_status.size() || !_tweaks_enabled[index])
@@ -455,11 +780,25 @@ bool Optimizer::save_journal() const
         state["registry"] = nlohmann::json::array();
         state["background"] = nlohmann::json::array();
         state["ac_power_settings"] = nlohmann::json::array();
+        state["advanced_processes"] = nlohmann::json::array();
+        state["services"] = nlohmann::json::array();
+        state["network_device_instance"] = _network_device_instance;
+        state["network_restart_needed"] = _network_restart_needed;
+        if (_dns_state.touched) {
+            state["dns"] = {{"interface", guid_text(_dns_state.interface_id)},
+                {"original", narrow_utf8(_dns_state.original)},
+                {"applied", narrow_utf8(_dns_state.applied)},
+                {"touched", true}};
+        }
         if (!_display_state.device.empty())
             state["display"] = {{"device", _display_state.device},
                 {"frequency", _display_state.frequency},
                 {"width", _display_state.width}, {"height", _display_state.height},
                 {"bits", _display_state.bits_per_pel},
+                {"orientation", _display_state.orientation},
+                {"fixed_output", _display_state.fixed_output},
+                {"position_x", _display_state.position_x},
+                {"position_y", _display_state.position_y},
                 {"applied_frequency", _display_state.applied_frequency}};
         if (_accessibility_state.filter_touched ||
             _accessibility_state.sticky_touched ||
@@ -479,6 +818,26 @@ bool Optimizer::save_journal() const
                 {"filter_touched", a.filter_touched},
                 {"sticky_touched", a.sticky_touched},
                 {"toggle_touched", a.toggle_touched}
+            };
+        }
+        const InputTuningState& tuning = _input_tuning_state;
+        if (tuning.filter_touched || tuning.delay_touched ||
+            tuning.speed_touched || tuning.mouse_touched) {
+            state["input_tuning"] = {
+                {"filter_touched", tuning.filter_touched},
+                {"filter_original", {tuning.filter.dwFlags, tuning.filter.iWaitMSec,
+                    tuning.filter.iDelayMSec, tuning.filter.iRepeatMSec,
+                    tuning.filter.iBounceMSec}},
+                {"filter_applied", {tuning.filter_applied.dwFlags,
+                    tuning.filter_applied.iWaitMSec, tuning.filter_applied.iDelayMSec,
+                    tuning.filter_applied.iRepeatMSec,
+                    tuning.filter_applied.iBounceMSec}},
+                {"delay_touched", tuning.delay_touched},
+                {"delay", tuning.delay}, {"delay_applied", tuning.delay_applied},
+                {"speed_touched", tuning.speed_touched},
+                {"speed", tuning.speed}, {"speed_applied", tuning.speed_applied},
+                {"mouse_touched", tuning.mouse_touched},
+                {"mouse", tuning.mouse}, {"mouse_applied", tuning.mouse_applied}
             };
         }
         for (const RegistryState& entry : _registry_state) {
@@ -509,6 +868,7 @@ bool Optimizer::save_journal() const
                 {"boost_touched", entry.boost_touched},
                 {"compare_and_swap", entry.compare_and_swap},
                 {"applied_priority", entry.applied_priority_class},
+                {"applied_throttling_control", entry.applied_throttling_control},
                 {"applied_throttling_state", entry.applied_throttling_state},
                 {"applied_memory_priority", entry.applied_memory_priority},
                 {"applied_boost_disabled", entry.applied_boost_disabled}
@@ -520,6 +880,21 @@ bool Optimizer::save_journal() const
                 {"kind", entry.kind}, {"original", entry.original},
                 {"applied", entry.applied},
                 {"compare_and_swap", entry.compare_and_swap}
+            });
+        }
+        for (const AdvancedProcessState& entry : _advanced_processes) {
+            state["advanced_processes"].push_back({
+                {"pid", entry.pid}, {"created_at", entry.created_at},
+                {"cpu_sets", entry.cpu_sets}, {"io_priority", entry.io_priority},
+                {"applied_io_priority", entry.applied_io_priority},
+                {"cpu_sets_touched", entry.cpu_sets_touched},
+                {"io_touched", entry.io_touched}
+            });
+        }
+        for (const ServiceState& entry : _service_states) {
+            state["services"].push_back({
+                {"name", entry.name}, {"original_state", entry.original_state},
+                {"applied_state", entry.applied_state}, {"touched", entry.touched}
             });
         }
         std::filesystem::create_directories(
@@ -591,6 +966,9 @@ void Optimizer::recover_journal()
             entry.boost_touched = item.value("boost_touched", false);
             entry.compare_and_swap = item.value("compare_and_swap", false);
             entry.applied_priority_class = item.value("applied_priority", DWORD(0));
+            entry.applied_throttling_control = item.value(
+                "applied_throttling_control",
+                DWORD(PROCESS_POWER_THROTTLING_EXECUTION_SPEED));
             entry.applied_throttling_state = item.value("applied_throttling_state", DWORD(0));
             entry.applied_memory_priority = item.value("applied_memory_priority", DWORD(0));
             entry.applied_boost_disabled = item.value("applied_boost_disabled", false);
@@ -603,6 +981,10 @@ void Optimizer::recover_journal()
             _display_state.width = display.at("width").get<DWORD>();
             _display_state.height = display.at("height").get<DWORD>();
             _display_state.bits_per_pel = display.at("bits").get<DWORD>();
+            _display_state.orientation = display.value("orientation", DWORD(DMDO_DEFAULT));
+            _display_state.fixed_output = display.value("fixed_output", DWORD(DMDFO_DEFAULT));
+            _display_state.position_x = display.value("position_x", LONG(0));
+            _display_state.position_y = display.value("position_y", LONG(0));
             _display_state.applied_frequency =
                 display.value("applied_frequency", DWORD(0));
         }
@@ -625,6 +1007,26 @@ void Optimizer::recover_journal()
             _accessibility_state.sticky_touched = a.at("sticky_touched").get<bool>();
             _accessibility_state.toggle_touched = a.at("toggle_touched").get<bool>();
         }
+        if (state.contains("input_tuning")) {
+            const auto& t = state.at("input_tuning");
+            InputTuningState& tuning = _input_tuning_state;
+            const auto original = t.at("filter_original").get<std::array<DWORD, 5>>();
+            const auto applied = t.at("filter_applied").get<std::array<DWORD, 5>>();
+            tuning.filter = {sizeof(FILTERKEYS), original[0], original[1],
+                             original[2], original[3], original[4]};
+            tuning.filter_applied = {sizeof(FILTERKEYS), applied[0], applied[1],
+                                     applied[2], applied[3], applied[4]};
+            tuning.filter_touched = t.at("filter_touched").get<bool>();
+            tuning.delay_touched = t.at("delay_touched").get<bool>();
+            tuning.delay = t.at("delay").get<UINT>();
+            tuning.delay_applied = t.at("delay_applied").get<UINT>();
+            tuning.speed_touched = t.at("speed_touched").get<bool>();
+            tuning.speed = t.at("speed").get<UINT>();
+            tuning.speed_applied = t.at("speed_applied").get<UINT>();
+            tuning.mouse_touched = t.at("mouse_touched").get<bool>();
+            tuning.mouse = t.at("mouse").get<std::array<int, 3>>();
+            tuning.mouse_applied = t.at("mouse_applied").get<std::array<int, 3>>();
+        }
         for (const auto& item : state.value("ac_power_settings", nlohmann::json::array())) {
             PowerSettingState entry{};
             if (!parse_guid(item.at("scheme").get<std::string>(), entry.scheme))
@@ -637,9 +1039,43 @@ void Optimizer::recover_journal()
                 throw std::runtime_error("Invalid power setting in recovery log");
             _power_settings.push_back(entry);
         }
-        bool okay = restore_accessibility_hotkeys();
+        for (const auto& item : state.value("advanced_processes", nlohmann::json::array())) {
+            AdvancedProcessState entry{};
+            entry.pid = item.at("pid").get<DWORD>();
+            entry.created_at = item.at("created_at").get<ULONGLONG>();
+            entry.cpu_sets = item.value("cpu_sets", std::vector<ULONG>{});
+            entry.io_priority = item.value("io_priority", ULONG(0));
+            entry.applied_io_priority = item.value("applied_io_priority", ULONG(0));
+            entry.cpu_sets_touched = item.value("cpu_sets_touched", false);
+            entry.io_touched = item.value("io_touched", false);
+            _advanced_processes.push_back(std::move(entry));
+        }
+        for (const auto& item : state.value("services", nlohmann::json::array())) {
+            ServiceState entry{};
+            entry.name = item.at("name").get<std::string>();
+            entry.original_state = item.at("original_state").get<DWORD>();
+            entry.applied_state = item.at("applied_state").get<DWORD>();
+            entry.touched = item.value("touched", false);
+            _service_states.push_back(std::move(entry));
+        }
+        _network_device_instance = state.value("network_device_instance", std::string());
+        _network_restart_needed = state.value("network_restart_needed", false);
+        if (state.contains("dns")) {
+            const auto& dns = state.at("dns");
+            if (!parse_guid(dns.at("interface").get<std::string>(),
+                            _dns_state.interface_id))
+                throw std::runtime_error("Invalid DNS interface in recovery log");
+            _dns_state.original = widen_utf8(dns.value("original", std::string()));
+            _dns_state.applied = widen_utf8(dns.value("applied", std::string()));
+            _dns_state.touched = dns.value("touched", false);
+        }
+        bool okay = restore_input_tuning();
+        okay = restore_accessibility_hotkeys() && okay;
+        okay = restore_advanced_processes() && okay;
+        okay = restore_services() && okay;
         okay = restore_background_processes() && okay;
         okay = restore_registry() && okay;
+        okay = restore_network() && okay;
         if (_session_power_plan_guid.empty())
             okay = restore_ac_power_settings() && okay;
         else
@@ -661,6 +1097,7 @@ void Optimizer::recover_journal()
         _power_settings.clear();
         _display_state = {};
         _accessibility_state = {};
+        _input_tuning_state = {};
         _restoration_status = "Session log unreadable - manual restore needed";
         _recovery_failed = true;
     }
@@ -721,9 +1158,18 @@ bool Optimizer::set_dword(HKEY root, const char* path, const char* name,
         set_status(tweak_index_for_label(label), TweakStatus::AlreadyConfigured);
         return true;
     }
-    const bool success = write_registry(root, path, name, REG_DWORD,
-                                        &value, sizeof(value));
-    record(success, label);
+    bool success = write_registry(root, path, name, REG_DWORD,
+                                  &value, sizeof(value));
+    HKEY key = nullptr;
+    DWORD verified = 0, type = 0, size = sizeof(verified);
+    success = success && RegOpenKeyExA(root, path, 0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS &&
+        RegQueryValueExA(key, name, nullptr, &type,
+                         reinterpret_cast<BYTE*>(&verified), &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && size == sizeof(verified) && verified == value;
+    if (key) RegCloseKey(key);
+    (success ? _applied : _failed).push_back(label);
+    set_status(tweak_index_for_label(label), success ? TweakStatus::Configured :
+                                                      TweakStatus::Failed);
     return success;
 }
 
@@ -740,9 +1186,21 @@ bool Optimizer::set_string(HKEY root, const char* path, const char* name,
         set_status(tweak_index_for_label(label), TweakStatus::AlreadyConfigured);
         return true;
     }
-    const bool success = write_registry(root, path, name, REG_SZ, value.c_str(),
-                                        static_cast<DWORD>(value.size() + 1));
-    record(success, label);
+    bool success = write_registry(root, path, name, REG_SZ, value.c_str(),
+                                  static_cast<DWORD>(value.size() + 1));
+    HKEY key = nullptr;
+    DWORD type = 0, size = 0;
+    success = success && RegOpenKeyExA(root, path, 0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS &&
+        RegQueryValueExA(key, name, nullptr, &type, nullptr, &size) == ERROR_SUCCESS &&
+        type == REG_SZ;
+    std::vector<char> verified(success ? size : 0);
+    success = success && RegQueryValueExA(key, name, nullptr, &type,
+        reinterpret_cast<BYTE*>(verified.data()), &size) == ERROR_SUCCESS &&
+        std::string(verified.data()) == value;
+    if (key) RegCloseKey(key);
+    (success ? _applied : _failed).push_back(label);
+    set_status(tweak_index_for_label(label), success ? TweakStatus::Configured :
+                                                      TweakStatus::Failed);
     return success;
 }
 
@@ -850,12 +1308,23 @@ bool Optimizer::launch_game(const std::string& game_path, bool launch_if_missing
         return false;
     }
 
-    if (enabled(12))
-        set_string(HKEY_CURRENT_USER,
-                   "Software\\Microsoft\\DirectX\\UserGpuPreferences",
-                   _target_game_path.c_str(), "GpuPreference=2;", "High-performance GPU preference");
+    // UserGpuPreferences is consumed when the process starts.  Writing it after
+    // attachment is a verified configuration change, not proof that the running
+    // game is already using that adapter preference.
+    const bool game_was_running = is_game_active(_target_game_path);
+    if (enabled(12)) {
+        const bool configured = set_string(
+            HKEY_CURRENT_USER,
+            "Software\\Microsoft\\DirectX\\UserGpuPreferences",
+            _target_game_path.c_str(), "GpuPreference=2;",
+            "High-performance GPU preference");
+        if (configured && game_was_running)
+            set_status(12, TweakStatus::RestartRequired);
+    }
 
     if (find_target_process()) {
+        if (enabled(12) && !game_was_running)
+            set_status(12, TweakStatus::RestartRequired);
         _applied.push_back("Attached to running game");
         return true;
     }
@@ -910,6 +1379,7 @@ bool Optimizer::launch_game(const std::string& game_path, bool launch_if_missing
 
     const bool tracked = track_process_for_restore(process.hProcess, process.dwProcessId);
     tune_game_process(process.hProcess, tracked);
+    tune_advanced_game_process(process.hProcess, process.dwProcessId);
 
     if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
         _last_error = "Game launch failed";
@@ -955,16 +1425,18 @@ bool Optimizer::track_process_for_restore(HANDLE process, DWORD pid)
     state.priority_touched = enabled(14) &&
         state.priority_class != HIGH_PRIORITY_CLASS;
     state.throttling_touched = enabled(13) && state.throttling_known &&
-        !(state.throttling.ControlMask &
-          ~PROCESS_POWER_THROTTLING_EXECUTION_SPEED) &&
-        (state.throttling.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED);
+        explicit_high_qos_required(state.throttling.ControlMask,
+                                   state.throttling.StateMask);
     state.memory_touched = enabled(27) && state.memory_known &&
         state.memory_priority < MEMORY_PRIORITY_NORMAL;
     state.boost_touched = enabled(26) && state.boost_known &&
         state.priority_boost_disabled;
     state.compare_and_swap = true;
     state.applied_priority_class = HIGH_PRIORITY_CLASS;
-    state.applied_throttling_state = 0;
+    const auto high_qos = explicit_high_qos_masks(state.throttling.ControlMask,
+                                                   state.throttling.StateMask);
+    state.applied_throttling_control = high_qos.control;
+    state.applied_throttling_state = high_qos.state;
     state.applied_memory_priority = MEMORY_PRIORITY_NORMAL;
     state.applied_boost_disabled = false;
     if (!state.priority_class) {
@@ -983,23 +1455,30 @@ void Optimizer::tune_game_process(HANDLE process, bool tracked)
 {
     if (enabled(13)) {
         PROCESS_POWER_THROTTLING_STATE throttling{};
-        throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-        throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
-        throttling.StateMask = 0;
+        if (tracked && !_background_state.empty()) {
+            throttling = _background_state.back().throttling;
+            throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            const auto masks = explicit_high_qos_masks(throttling.ControlMask,
+                                                        throttling.StateMask);
+            throttling.ControlMask = masks.control;
+            throttling.StateMask = masks.state;
+        }
         if (tracked && !_background_state.back().throttling_known)
-            set_status(13, TweakStatus::Unsupported);
-        else if (tracked &&
-                 (_background_state.back().throttling.ControlMask &
-                  ~PROCESS_POWER_THROTTLING_EXECUTION_SPEED) &&
-                 (_background_state.back().throttling.StateMask &
-                  PROCESS_POWER_THROTTLING_EXECUTION_SPEED))
             set_status(13, TweakStatus::Unsupported);
         else if (tracked && !_background_state.back().throttling_touched)
             set_status(13, TweakStatus::AlreadyConfigured);
-        else
-            record(tracked && SetProcessInformation(process, ProcessPowerThrottling,
-                                                     &throttling, sizeof(throttling)) != FALSE,
-                   "Game power throttling off");
+        else {
+            const bool written = tracked && SetProcessInformation(
+                process, ProcessPowerThrottling, &throttling,
+                sizeof(throttling)) != FALSE;
+            PROCESS_POWER_THROTTLING_STATE verified{};
+            verified.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            const bool okay = written && GetProcessInformation(
+                process, ProcessPowerThrottling, &verified, sizeof(verified)) &&
+                verified.ControlMask == throttling.ControlMask &&
+                verified.StateMask == throttling.StateMask;
+            record(okay, "Game power throttling off");
+        }
     }
     if (enabled(14)) {
         if (tracked && !_background_state.back().priority_touched)
@@ -1043,6 +1522,11 @@ void Optimizer::tune_game_process(HANDLE process, bool tracked)
 
 void Optimizer::throttle_background_processes()
 {
+    if (!(enabled(11) || enabled(19) || enabled(20) || enabled(21) ||
+          enabled(22) || enabled(29) || enabled(30) || enabled(31) ||
+          enabled(32) || enabled(33) || enabled(34) || enabled(35) ||
+          enabled(36)))
+        return;
     // Only non-essential sync/index/update helpers are targeted. Browsers,
     // launchers, Discord/voice, audio and device software are preserved.
     struct Target { const char* name; size_t cpu_tweak; size_t memory_tweak; };
@@ -1138,16 +1622,20 @@ void Optimizer::throttle_background_processes()
                 state.priority_class != IDLE_PRIORITY_CLASS;
             state.throttling_touched = state.throttling_known &&
                 target->cpu_tweak == 34 && enabled(35) &&
-                !(state.throttling.ControlMask &
-                  ~PROCESS_POWER_THROTTLING_EXECUTION_SPEED) &&
-                !(state.throttling.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED);
+                (!(state.throttling.ControlMask &
+                   PROCESS_POWER_THROTTLING_EXECUTION_SPEED) ||
+                 !(state.throttling.StateMask &
+                   PROCESS_POWER_THROTTLING_EXECUTION_SPEED));
             const DWORD desired_memory = target->memory_tweak == 36 ?
                 MEMORY_PRIORITY_LOW : MEMORY_PRIORITY_BELOW_NORMAL;
             state.memory_touched = enabled(target->memory_tweak) &&
                 state.memory_known && state.memory_priority > desired_memory;
             state.compare_and_swap = true;
             state.applied_priority_class = BELOW_NORMAL_PRIORITY_CLASS;
-            state.applied_throttling_state = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+            state.applied_throttling_control = state.throttling.ControlMask |
+                PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+            state.applied_throttling_state = state.throttling.StateMask |
+                PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
             state.applied_memory_priority = desired_memory;
             state.applied_boost_disabled = state.priority_boost_disabled;
 
@@ -1181,11 +1669,16 @@ void Optimizer::throttle_background_processes()
             }
             if (target->cpu_tweak == 34 && enabled(35)) {
                 const bool needs_eco = state.throttling_known &&
-                    !(state.throttling.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED);
-                PROCESS_POWER_THROTTLING_STATE eco{};
+                    (!(state.throttling.ControlMask &
+                       PROCESS_POWER_THROTTLING_EXECUTION_SPEED) ||
+                     !(state.throttling.StateMask &
+                       PROCESS_POWER_THROTTLING_EXECUTION_SPEED));
+                PROCESS_POWER_THROTTLING_STATE eco = state.throttling;
                 eco.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-                eco.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
-                eco.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+                const auto masks = explicit_eco_qos_masks(eco.ControlMask,
+                                                           eco.StateMask);
+                eco.ControlMask = masks.control;
+                eco.StateMask = masks.state;
                 const bool eco_ok = state.throttling_known &&
                     (!needs_eco || (state.throttling_touched &&
                      SetProcessInformation(process, ProcessPowerThrottling,
@@ -1268,8 +1761,6 @@ bool Optimizer::restore_background_processes()
             }
             if (state.throttling_touched && state.throttling_known) {
                 PROCESS_POWER_THROTTLING_STATE original = state.throttling;
-                original.ControlMask &= PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
-                original.StateMask &= PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
                 PROCESS_POWER_THROTTLING_STATE current{};
                 current.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
                 if (!GetProcessInformation(process, ProcessPowerThrottling,
@@ -1278,8 +1769,7 @@ bool Optimizer::restore_background_processes()
                 else if (current.ControlMask != original.ControlMask ||
                          current.StateMask != original.StateMask) {
                     if (state.compare_and_swap &&
-                        (current.ControlMask !=
-                         PROCESS_POWER_THROTTLING_EXECUTION_SPEED ||
+                        (current.ControlMask != state.applied_throttling_control ||
                          current.StateMask != state.applied_throttling_state))
                         okay = false;
                     else if (!SetProcessInformation(process, ProcessPowerThrottling,
@@ -1657,15 +2147,769 @@ bool Optimizer::restore_accessibility_hotkeys()
     return okay;
 }
 
-void Optimizer::optimize_display_refresh()
+namespace {
+bool same_filter(const FILTERKEYS& left, const FILTERKEYS& right)
+{
+    return left.dwFlags == right.dwFlags &&
+           left.iWaitMSec == right.iWaitMSec &&
+           left.iDelayMSec == right.iDelayMSec &&
+           left.iRepeatMSec == right.iRepeatMSec &&
+           left.iBounceMSec == right.iBounceMSec;
+}
+}
+
+void Optimizer::optimize_input_tuning()
+{
+    if (enabled(41)) {
+        FILTERKEYS original{};
+        original.cbSize = sizeof(original);
+        if (!SystemParametersInfoW(SPI_GETFILTERKEYS, sizeof(original),
+                                   &original, 0)) {
+            set_status(41, TweakStatus::Failed);
+        } else {
+            FILTERKEYS desired = original;
+            desired.dwFlags = (original.dwFlags | FKF_FILTERKEYSON) &
+                              ~(FKF_HOTKEYACTIVE | FKF_CONFIRMHOTKEY);
+            desired.iWaitMSec = 1;
+            desired.iDelayMSec = 100;
+            desired.iRepeatMSec = 20;
+            desired.iBounceMSec = 0;
+            if (same_filter(original, desired)) {
+                set_status(41, TweakStatus::AlreadyConfigured);
+            } else if (original.dwFlags & FKF_FILTERKEYSON) {
+                set_status(41, TweakStatus::Skipped);
+            } else {
+                _input_tuning_state.filter = original;
+                _input_tuning_state.filter_applied = desired;
+                _input_tuning_state.filter_touched = true;
+                if (!save_journal()) {
+                    _input_tuning_state.filter_touched = false;
+                    set_status(41, TweakStatus::Failed);
+                } else {
+                    FILTERKEYS verified{};
+                    verified.cbSize = sizeof(verified);
+                    const bool okay = SystemParametersInfoW(
+                        SPI_SETFILTERKEYS, sizeof(desired), &desired, 0) &&
+                        SystemParametersInfoW(
+                            SPI_GETFILTERKEYS, sizeof(verified), &verified, 0) &&
+                        same_filter(verified, desired);
+                    set_status(41, okay ? TweakStatus::Applied :
+                                         TweakStatus::Failed);
+                    if (okay) _applied.push_back("FilterKeys fast repeat");
+                }
+            }
+        }
+    }
+
+    if (enabled(42)) {
+        UINT original = 0;
+        if (!SystemParametersInfoW(SPI_GETKEYBOARDDELAY, 0, &original, 0)) {
+            set_status(42, TweakStatus::Failed);
+        } else if (original == 0) {
+            set_status(42, TweakStatus::AlreadyConfigured);
+        } else {
+            _input_tuning_state.delay = original;
+            _input_tuning_state.delay_applied = 0;
+            _input_tuning_state.delay_touched = true;
+            if (!save_journal()) {
+                _input_tuning_state.delay_touched = false;
+                set_status(42, TweakStatus::Failed);
+            } else {
+                UINT verified = 0;
+                const bool okay = SystemParametersInfoW(
+                    SPI_SETKEYBOARDDELAY, 0, nullptr, 0) &&
+                    SystemParametersInfoW(
+                        SPI_GETKEYBOARDDELAY, 0, &verified, 0) && verified == 0;
+                set_status(42, okay ? TweakStatus::Applied : TweakStatus::Failed);
+                if (okay) _applied.push_back("Keyboard repeat delay shortest");
+            }
+        }
+    }
+
+    if (enabled(43)) {
+        UINT original = 0;
+        if (!SystemParametersInfoW(SPI_GETKEYBOARDSPEED, 0, &original, 0)) {
+            set_status(43, TweakStatus::Failed);
+        } else if (original == 31) {
+            set_status(43, TweakStatus::AlreadyConfigured);
+        } else {
+            _input_tuning_state.speed = original;
+            _input_tuning_state.speed_applied = 31;
+            _input_tuning_state.speed_touched = true;
+            if (!save_journal()) {
+                _input_tuning_state.speed_touched = false;
+                set_status(43, TweakStatus::Failed);
+            } else {
+                UINT verified = 0;
+                const bool okay = SystemParametersInfoW(
+                    SPI_SETKEYBOARDSPEED, 31, nullptr, 0) &&
+                    SystemParametersInfoW(
+                        SPI_GETKEYBOARDSPEED, 0, &verified, 0) && verified == 31;
+                set_status(43, okay ? TweakStatus::Applied : TweakStatus::Failed);
+                if (okay) _applied.push_back("Keyboard repeat speed fastest");
+            }
+        }
+    }
+}
+
+bool Optimizer::restore_input_tuning()
+{
+    InputTuningState& state = _input_tuning_state;
+    bool okay = true;
+    if (state.mouse_touched) {
+        std::array<int, 3> current{};
+        if (!SystemParametersInfoW(SPI_GETMOUSE, 0, current.data(), 0))
+            okay = false;
+        else if (current != state.mouse) {
+            std::array<int, 3> verified{};
+            if (current != state.mouse_applied ||
+                !SystemParametersInfoW(SPI_SETMOUSE, 0, state.mouse.data(), 0) ||
+                !SystemParametersInfoW(SPI_GETMOUSE, 0, verified.data(), 0) ||
+                verified != state.mouse)
+                okay = false;
+        }
+    }
+    if (state.speed_touched) {
+        UINT current = 0;
+        if (!SystemParametersInfoW(SPI_GETKEYBOARDSPEED, 0, &current, 0))
+            okay = false;
+        else if (current != state.speed) {
+            UINT verified = 0;
+            if (current != state.speed_applied ||
+                !SystemParametersInfoW(SPI_SETKEYBOARDSPEED, state.speed,
+                                       nullptr, 0) ||
+                !SystemParametersInfoW(SPI_GETKEYBOARDSPEED, 0, &verified, 0) ||
+                verified != state.speed)
+                okay = false;
+        }
+    }
+    if (state.delay_touched) {
+        UINT current = 0;
+        if (!SystemParametersInfoW(SPI_GETKEYBOARDDELAY, 0, &current, 0))
+            okay = false;
+        else if (current != state.delay) {
+            UINT verified = 0;
+            if (current != state.delay_applied ||
+                !SystemParametersInfoW(SPI_SETKEYBOARDDELAY, state.delay,
+                                       nullptr, 0) ||
+                !SystemParametersInfoW(SPI_GETKEYBOARDDELAY, 0, &verified, 0) ||
+                verified != state.delay)
+                okay = false;
+        }
+    }
+    if (state.filter_touched) {
+        FILTERKEYS current{};
+        current.cbSize = sizeof(current);
+        if (!SystemParametersInfoW(SPI_GETFILTERKEYS, sizeof(current),
+                                   &current, 0))
+            okay = false;
+        else if (!same_filter(current, state.filter)) {
+            FILTERKEYS verified{};
+            verified.cbSize = sizeof(verified);
+            if (!same_filter(current, state.filter_applied) ||
+                !SystemParametersInfoW(SPI_SETFILTERKEYS, sizeof(state.filter),
+                                       &state.filter, 0) ||
+                !SystemParametersInfoW(SPI_GETFILTERKEYS, sizeof(verified),
+                                       &verified, 0) ||
+                !same_filter(verified, state.filter))
+                okay = false;
+        }
+    }
+    if (okay) state = {};
+    return okay;
+}
+
+namespace {
+using NtQueryInformationProcessFn = LONG (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+using NtSetInformationProcessFn = LONG (NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
+using NtSetTimerResolutionFn = LONG (NTAPI*)(ULONG, BOOLEAN, PULONG);
+constexpr ULONG PROCESS_IO_PRIORITY_CLASS = 33;
+
+NtQueryInformationProcessFn nt_query_process()
+{
+    static NtQueryInformationProcessFn fn = [] {
+        FARPROC address = GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                         "NtQueryInformationProcess");
+        NtQueryInformationProcessFn value = nullptr;
+        static_assert(sizeof(value) == sizeof(address));
+        std::memcpy(&value, &address, sizeof(value));
+        return value;
+    }();
+    return fn;
+}
+
+NtSetInformationProcessFn nt_set_process()
+{
+    static NtSetInformationProcessFn fn = [] {
+        FARPROC address = GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                         "NtSetInformationProcess");
+        NtSetInformationProcessFn value = nullptr;
+        static_assert(sizeof(value) == sizeof(address));
+        std::memcpy(&value, &address, sizeof(value));
+        return value;
+    }();
+    return fn;
+}
+
+bool query_io_priority(HANDLE process, ULONG& value)
+{
+    auto query = nt_query_process();
+    return query && query(process, PROCESS_IO_PRIORITY_CLASS, &value,
+                          sizeof(value), nullptr) >= 0;
+}
+
+bool set_io_priority(HANDLE process, ULONG value)
+{
+    auto set = nt_set_process();
+    return set && set(process, PROCESS_IO_PRIORITY_CLASS, &value,
+                      sizeof(value)) >= 0;
+}
+
+bool process_identity(HANDLE process, ULONGLONG& created_at)
+{
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(process, &created, &exited, &kernel, &user))
+        return false;
+    created_at = filetime_ticks(created);
+    return true;
+}
+
+bool wait_service_state(SC_HANDLE service, DWORD desired, DWORD timeout_ms)
+{
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    do {
+        SERVICE_STATUS_PROCESS status{};
+        DWORD needed = 0;
+        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                                  reinterpret_cast<BYTE*>(&status), sizeof(status),
+                                  &needed))
+            return false;
+        if (status.dwCurrentState == desired)
+            return true;
+        Sleep(50);
+    } while (GetTickCount64() < deadline);
+    return false;
+}
+}
+
+void Optimizer::request_timer_resolution()
+{
+    if (!enabled(57))
+        return;
+    FARPROC address = GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                     "NtSetTimerResolution");
+    NtSetTimerResolutionFn set = nullptr;
+    static_assert(sizeof(set) == sizeof(address));
+    std::memcpy(&set, &address, sizeof(set));
+    ULONG actual = 0;
+    _timer_resolution_active = set && set(5000, TRUE, &actual) >= 0;
+    set_status(57, _timer_resolution_active ? TweakStatus::Applied :
+                                             TweakStatus::Unsupported);
+    if (_timer_resolution_active)
+        _applied.push_back("Global timer resolution: 0.5 ms");
+}
+
+void Optimizer::release_timer_resolution()
+{
+    if (!_timer_resolution_active)
+        return;
+    FARPROC address = GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                     "NtSetTimerResolution");
+    NtSetTimerResolutionFn set = nullptr;
+    static_assert(sizeof(set) == sizeof(address));
+    std::memcpy(&set, &address, sizeof(set));
+    ULONG actual = 0;
+    if (set)
+        set(5000, FALSE, &actual);
+    _timer_resolution_active = false;
+}
+
+bool Optimizer::pause_service(const char* name, size_t tweak)
+{
+    SC_HANDLE manager = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager) {
+        set_status(tweak, GetLastError() == ERROR_ACCESS_DENIED ?
+                   TweakStatus::AccessDenied : TweakStatus::Failed);
+        return false;
+    }
+    SC_HANDLE service = OpenServiceA(manager, name, SERVICE_QUERY_STATUS |
+                                     SERVICE_PAUSE_CONTINUE | SERVICE_STOP |
+                                     SERVICE_START);
+    if (!service) {
+        const DWORD error = GetLastError();
+        CloseServiceHandle(manager);
+        set_status(tweak, error == ERROR_SERVICE_DOES_NOT_EXIST ?
+                   TweakStatus::Unsupported : error == ERROR_ACCESS_DENIED ?
+                   TweakStatus::AccessDenied : TweakStatus::Failed);
+        return false;
+    }
+    SERVICE_STATUS_PROCESS status{};
+    DWORD needed = 0;
+    if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                              reinterpret_cast<BYTE*>(&status), sizeof(status),
+                              &needed)) {
+        CloseServiceHandle(service); CloseServiceHandle(manager);
+        set_status(tweak, TweakStatus::Failed);
+        return false;
+    }
+    if (status.dwCurrentState == SERVICE_STOPPED ||
+        status.dwCurrentState == SERVICE_PAUSED) {
+        CloseServiceHandle(service); CloseServiceHandle(manager);
+        set_status(tweak, TweakStatus::AlreadyConfigured);
+        return true;
+    }
+    ServiceState saved{name, status.dwCurrentState, SERVICE_STOPPED, true};
+    _service_states.push_back(saved);
+    if (!save_journal()) {
+        _service_states.pop_back();
+        CloseServiceHandle(service); CloseServiceHandle(manager);
+        set_status(tweak, TweakStatus::Failed);
+        return false;
+    }
+    SERVICE_STATUS result{};
+    DWORD target = SERVICE_STOPPED;
+    bool changed = false;
+    if ((status.dwControlsAccepted & SERVICE_ACCEPT_PAUSE_CONTINUE) &&
+        ControlService(service, SERVICE_CONTROL_PAUSE, &result)) {
+        target = SERVICE_PAUSED;
+        changed = wait_service_state(service, target, 5000);
+    } else if ((status.dwControlsAccepted & SERVICE_ACCEPT_STOP) &&
+               ControlService(service, SERVICE_CONTROL_STOP, &result)) {
+        target = SERVICE_STOPPED;
+        changed = wait_service_state(service, target, 10000);
+    }
+    _service_states.back().applied_state = target;
+    save_journal();
+    CloseServiceHandle(service); CloseServiceHandle(manager);
+    set_status(tweak, changed ? TweakStatus::Applied : TweakStatus::Failed);
+    if (changed)
+        _applied.push_back(std::string("Paused service: ") + name);
+    return changed;
+}
+
+void Optimizer::optimize_advanced_session()
+{
+    request_timer_resolution();
+    if (enabled(58))
+        pause_service("WSearch", 58);
+    if (enabled(59)) {
+        const bool bits = pause_service("BITS", 59);
+        const bool delivery = pause_service("DoSvc", 59);
+        if (bits || delivery)
+            set_status(59, TweakStatus::Applied);
+    }
+}
+
+void Optimizer::tune_advanced_game_process(HANDLE process, DWORD pid)
+{
+    if (!process || (!enabled(54) && !enabled(55)))
+        return;
+    AdvancedProcessState state{};
+    state.pid = pid;
+    if (!process_identity(process, state.created_at)) {
+        if (enabled(54)) set_status(54, TweakStatus::Failed);
+        if (enabled(55)) set_status(55, TweakStatus::Failed);
+        return;
+    }
+    if (enabled(54)) {
+        ULONG count = 0;
+        GetProcessDefaultCpuSets(process, nullptr, 0, &count);
+        state.cpu_sets.resize(count);
+        if (count && !GetProcessDefaultCpuSets(process, state.cpu_sets.data(),
+                                               count, &count)) {
+            state.cpu_sets.clear();
+            set_status(54, TweakStatus::Failed);
+        } else {
+            ULONG bytes = 0;
+            GetSystemCpuSetInformation(nullptr, 0, &bytes, process, 0);
+            std::vector<unsigned char> data(bytes);
+            bool okay = bytes && GetSystemCpuSetInformation(
+                reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(data.data()),
+                bytes, &bytes, process, 0);
+            BYTE best = 255, worst = 0;
+            std::vector<ULONG> performance;
+            for (ULONG offset = 0; okay && offset < bytes;) {
+                auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(
+                    data.data() + offset);
+                if (!info->Size) break;
+                if (info->Type == CpuSetInformation) {
+                    best = std::min(best, info->CpuSet.EfficiencyClass);
+                    worst = std::max(worst, info->CpuSet.EfficiencyClass);
+                }
+                offset += info->Size;
+            }
+            for (ULONG offset = 0; okay && offset < bytes;) {
+                auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(
+                    data.data() + offset);
+                if (!info->Size) break;
+                if (info->Type == CpuSetInformation &&
+                    info->CpuSet.EfficiencyClass == best &&
+                    !info->CpuSet.Parked &&
+                    (!info->CpuSet.Allocated || info->CpuSet.AllocatedToTargetProcess))
+                    performance.push_back(info->CpuSet.Id);
+                offset += info->Size;
+            }
+            if (!okay || best == worst || performance.empty()) {
+                set_status(54, TweakStatus::Unsupported);
+            } else {
+                state.cpu_sets_touched = true;
+                _advanced_processes.push_back(state);
+                if (!save_journal()) {
+                    _advanced_processes.pop_back();
+                    state.cpu_sets_touched = false;
+                    set_status(54, TweakStatus::Failed);
+                } else {
+                    const bool applied = SetProcessDefaultCpuSets(
+                        process, performance.data(),
+                        static_cast<ULONG>(performance.size())) != FALSE;
+                    set_status(54, applied ? TweakStatus::Applied : TweakStatus::Failed);
+                    if (!applied) {
+                        _advanced_processes.pop_back(); save_journal();
+                        state.cpu_sets_touched = false;
+                    }
+                }
+            }
+        }
+    }
+    if (enabled(55)) {
+        ULONG original = 0;
+        if (!query_io_priority(process, original)) {
+            set_status(55, TweakStatus::Unsupported);
+        } else if (original >= 3) {
+            set_status(55, TweakStatus::AlreadyConfigured);
+        } else {
+            auto found = std::find_if(_advanced_processes.begin(),
+                _advanced_processes.end(), [pid](const AdvancedProcessState& item) {
+                    return item.pid == pid;
+                });
+            if (found == _advanced_processes.end()) {
+                state.io_priority = original;
+                state.applied_io_priority = 3;
+                state.io_touched = true;
+                _advanced_processes.push_back(state);
+                found = std::prev(_advanced_processes.end());
+            } else {
+                found->io_priority = original;
+                found->applied_io_priority = 3;
+                found->io_touched = true;
+            }
+            if (!save_journal() || !set_io_priority(process, 3)) {
+                set_status(55, TweakStatus::Failed);
+            } else {
+                set_status(55, TweakStatus::Applied);
+                _applied.push_back("High game I/O priority");
+            }
+        }
+    }
+}
+
+void Optimizer::tune_background_io()
+{
+    if (!enabled(56))
+        return;
+    static const char* names[] = {
+        "OneDrive.exe", "Dropbox.exe", "GoogleDriveFS.exe", "iCloudDrive.exe",
+        "SearchIndexer.exe", "SearchProtocolHost.exe", "SearchFilterHost.exe",
+        "CCXProcess.exe", "Creative Cloud.exe", "AdobeUpdateService.exe",
+        "MicrosoftEdgeUpdate.exe", "GoogleUpdater.exe", "GoogleUpdate.exe"
+    };
+    bool found_any = false, changed_any = false;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        set_status(56, TweakStatus::Failed); return;
+    }
+    PROCESSENTRY32 entry{}; entry.dwSize = sizeof(entry);
+    if (Process32First(snapshot, &entry)) do {
+        bool match = false;
+        for (const char* name : names)
+            if (_stricmp(name, entry.szExeFile) == 0) { match = true; break; }
+        if (!match) continue;
+        found_any = true;
+        if (std::any_of(_advanced_processes.begin(), _advanced_processes.end(),
+            [&](const AdvancedProcessState& item) {
+                return item.pid == entry.th32ProcessID && item.io_touched;
+            })) continue;
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+                                     PROCESS_SET_INFORMATION, FALSE,
+                                     entry.th32ProcessID);
+        if (!process) continue;
+        ULONG original = 0;
+        AdvancedProcessState state{};
+        state.pid = entry.th32ProcessID;
+        if (process_identity(process, state.created_at) &&
+            query_io_priority(process, original) && original > 0) {
+            state.io_priority = original;
+            state.applied_io_priority = 0;
+            state.io_touched = true;
+            _advanced_processes.push_back(state);
+            if (save_journal() && set_io_priority(process, 0))
+                changed_any = true;
+            else {
+                _advanced_processes.pop_back(); save_journal();
+            }
+        }
+        CloseHandle(process);
+    } while (Process32Next(snapshot, &entry));
+    CloseHandle(snapshot);
+    set_status(56, changed_any ? TweakStatus::Applied :
+                   found_any ? TweakStatus::Skipped : TweakStatus::Skipped);
+    if (changed_any) _applied.push_back("Low background I/O priority");
+}
+
+bool Optimizer::restore_advanced_processes()
+{
+    bool okay = true;
+    for (auto item = _advanced_processes.rbegin();
+         item != _advanced_processes.rend(); ++item) {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+                                     PROCESS_SET_INFORMATION, FALSE, item->pid);
+        if (!process) continue;
+        ULONGLONG created = 0;
+        if (!process_identity(process, created) || created != item->created_at) {
+            CloseHandle(process); continue;
+        }
+        if (item->io_touched) {
+            ULONG current = 0;
+            if (!query_io_priority(process, current) ||
+                (current != item->io_priority &&
+                 (current != item->applied_io_priority ||
+                  !set_io_priority(process, item->io_priority))))
+                okay = false;
+        }
+        if (item->cpu_sets_touched) {
+            ULONG count = 0;
+            GetProcessDefaultCpuSets(process, nullptr, 0, &count);
+            std::vector<ULONG> current(count);
+            if ((count && !GetProcessDefaultCpuSets(process, current.data(), count, &count)) ||
+                !SetProcessDefaultCpuSets(process,
+                    item->cpu_sets.empty() ? nullptr : item->cpu_sets.data(),
+                    static_cast<ULONG>(item->cpu_sets.size())))
+                okay = false;
+        }
+        CloseHandle(process);
+    }
+    _advanced_processes.clear();
+    return okay;
+}
+
+bool Optimizer::restore_services()
+{
+    bool okay = true;
+    SC_HANDLE manager = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager && !_service_states.empty()) return false;
+    for (auto item = _service_states.rbegin(); item != _service_states.rend(); ++item) {
+        if (!item->touched) continue;
+        SC_HANDLE service = OpenServiceA(manager, item->name.c_str(),
+                                         SERVICE_QUERY_STATUS |
+                                         SERVICE_PAUSE_CONTINUE | SERVICE_START);
+        if (!service) { okay = false; continue; }
+        SERVICE_STATUS_PROCESS status{}; DWORD needed = 0;
+        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                                  reinterpret_cast<BYTE*>(&status), sizeof(status),
+                                  &needed)) okay = false;
+        else if (status.dwCurrentState != item->original_state) {
+            if (status.dwCurrentState != item->applied_state) okay = false;
+            else if (item->original_state == SERVICE_RUNNING) {
+                SERVICE_STATUS ignored{};
+                if (status.dwCurrentState == SERVICE_PAUSED) {
+                    if (!ControlService(service, SERVICE_CONTROL_CONTINUE, &ignored) ||
+                        !wait_service_state(service, SERVICE_RUNNING, 5000)) okay = false;
+                } else if (!StartServiceA(service, 0, nullptr) ||
+                           !wait_service_state(service, SERVICE_RUNNING, 10000)) okay = false;
+            }
+        }
+        CloseServiceHandle(service);
+    }
+    if (manager) CloseServiceHandle(manager);
+    _service_states.clear();
+    return okay;
+}
+
+void Optimizer::optimize_network(bool may_restart)
+{
+    bool any = false;
+    for (size_t index = 45; index <= 53; ++index)
+        any = any || enabled(index);
+    if (!any) return;
+    ActiveAdapterInfo adapter{};
+    if (!active_adapter(adapter)) {
+        for (size_t index = 45; index <= 53; ++index)
+            if (enabled(index)) set_status(index, TweakStatus::Unsupported);
+        return;
+    }
+    const bool ethernet = adapter.type == IF_TYPE_ETHERNET_CSMACD;
+    const bool wifi = adapter.type == IF_TYPE_IEEE80211;
+    _network_device_instance = adapter.device_instance;
+    save_journal();
+
+    auto property = [&](size_t tweak, const std::vector<const char*>& keywords,
+                        const std::vector<std::string>& wanted) {
+        if (!enabled(tweak)) return;
+        if (!may_restart) { set_status(tweak, TweakStatus::Skipped); return; }
+        for (const char* keyword : keywords) {
+            DWORD type = 0, number = 0; std::string text;
+            if (!driver_enum_value(adapter, keyword, wanted, type, text, number))
+                continue;
+            const size_t previous = _registry_state.size();
+            const bool okay = type == REG_DWORD ?
+                set_dword(HKEY_LOCAL_MACHINE, adapter.registry_path.c_str(),
+                          keyword, number, TWEAK_CATALOG[tweak].label) :
+                set_string(HKEY_LOCAL_MACHINE, adapter.registry_path.c_str(),
+                           keyword, text, TWEAK_CATALOG[tweak].label);
+            if (okay && _registry_state.size() > previous)
+                _network_restart_needed = true;
+            return;
+        }
+        set_status(tweak, TweakStatus::Unsupported);
+    };
+
+    if (enabled(45)) {
+        GetInterfaceDnsSettingsFn get = nullptr;
+        SetInterfaceDnsSettingsFn set = nullptr;
+        FreeInterfaceDnsSettingsFn release = nullptr;
+        WSADATA winsock{};
+        if (!dns_api(get, set, release) || WSAStartup(MAKEWORD(2,2), &winsock) != 0) {
+            set_status(45, TweakStatus::Unsupported);
+        } else {
+            const std::wstring original = current_dns_servers(adapter.id);
+            const std::string current = effective_dns_server(adapter.index);
+            struct Candidate { const char* primary; const wchar_t* pair; };
+            const Candidate candidates[] = {
+                {"1.1.1.1", L"1.1.1.1,1.0.0.1"},
+                {"8.8.8.8", L"8.8.8.8,8.8.4.4"},
+                {"9.9.9.9", L"9.9.9.9,149.112.112.112"}
+            };
+            int current_latency = current.empty() ? -1 : dns_latency_ms(current.c_str());
+            int best_latency = current_latency;
+            const Candidate* best = nullptr;
+            for (const Candidate& candidate : candidates) {
+                const int latency = dns_latency_ms(candidate.primary);
+                if (latency >= 0 && (best_latency < 0 || latency < best_latency)) {
+                    best_latency = latency; best = &candidate;
+                }
+            }
+            if (!best || (current_latency >= 0 &&
+                          best_latency + 2 >= current_latency)) {
+                set_status(45, TweakStatus::AlreadyConfigured);
+            } else {
+                _dns_state.interface_id = adapter.id;
+                _dns_state.original = original;
+                _dns_state.applied = best->pair;
+                _dns_state.touched = true;
+                if (!save_journal() || !set_dns_servers(adapter.id, _dns_state.applied) ||
+                    !same_dns_servers(current_dns_servers(adapter.id), _dns_state.applied)) {
+                    if (same_dns_servers(current_dns_servers(adapter.id), _dns_state.applied))
+                        set_dns_servers(adapter.id, original);
+                    _dns_state = {};
+                    save_journal();
+                    set_status(45, TweakStatus::Failed);
+                } else {
+                    set_status(45, TweakStatus::Applied);
+                    _applied.push_back("Fastest DNS for active adapter");
+                }
+            }
+            WSACleanup();
+        }
+    }
+    if (ethernet) {
+        property(46, {"*RSS"}, {"enabled", "on"});
+        property(47, {"*InterruptModeration", "InterruptModeration"},
+                 {"disabled", "off"});
+        property(48, {"*RscIPv4", "*RscIPv6", "RSC"},
+                 {"disabled", "off"});
+        property(49, {"*EEE", "EEELinkAdvertisement", "AdvancedEEE",
+                      "EnableGreenEthernet"}, {"disabled", "off"});
+        property(50, {"*FlowControl", "FlowControl"}, {"disabled", "off"});
+    } else {
+        for (size_t index = 46; index <= 50; ++index)
+            if (enabled(index)) set_status(index, TweakStatus::Unsupported);
+    }
+    // The device power checkbox is not a stable NDIS advanced property. It is
+    // intentionally skipped unless a driver exposes a real enumerated setting.
+    property(51, {"PowerSavingMode", "PowerSaveMode"},
+             {"disabled", "maximum performance", "off"});
+    if (wifi) {
+        property(52, {"MIMOPowerSaveMode", "MimoPowerSaveMode"},
+                 {"no smps"});
+        property(53, {"TransmitPower", "*TransmitPower"},
+                 {"highest", "maximum"});
+    } else {
+        if (enabled(52)) set_status(52, TweakStatus::Unsupported);
+        if (enabled(53)) set_status(53, TweakStatus::Unsupported);
+    }
+    if (_network_restart_needed) {
+        save_journal();
+        bool connected = restart_adapter_device(_network_device_instance);
+        const ULONGLONG deadline = GetTickCount64() + 15000;
+        while (connected && GetTickCount64() < deadline) {
+            ActiveAdapterInfo check{};
+            if (active_adapter(check)) break;
+            Sleep(200);
+        }
+        ActiveAdapterInfo check{};
+        connected = connected && active_adapter(check);
+        if (!connected) {
+            for (size_t index = 46; index <= 53; ++index)
+                if (enabled(index) && _tweak_status[index] == TweakStatus::Applied)
+                    _tweak_status[index] = TweakStatus::Failed;
+            const bool rolled_back = restore_registry();
+            const bool network_restored = restore_network();
+            if (rolled_back && network_restored) {
+                save_journal();
+            } else {
+                _recovery_failed = true;
+                _restoration_status = "Network recovery incomplete";
+            }
+        }
+    }
+}
+
+bool Optimizer::restore_network()
+{
+    bool okay = true;
+    if (_dns_state.touched) {
+        const std::wstring current = current_dns_servers(_dns_state.interface_id);
+        if (!same_dns_servers(current, _dns_state.original)) {
+            if (!same_dns_servers(current, _dns_state.applied) ||
+                !set_dns_servers(_dns_state.interface_id, _dns_state.original) ||
+                !same_dns_servers(current_dns_servers(_dns_state.interface_id),
+                                  _dns_state.original))
+                okay = false;
+        }
+        if (okay) _dns_state = {};
+    }
+    if (!_network_restart_needed) {
+        _network_device_instance.clear();
+        return okay;
+    }
+    const bool restarted = restart_adapter_device(_network_device_instance);
+    if (restarted) {
+        _network_restart_needed = false;
+        _network_device_instance.clear();
+    }
+    return okay && restarted;
+}
+
+void Optimizer::optimize_display_refresh(DWORD game_pid)
 {
     DISPLAY_DEVICEA device{};
     device.cb = sizeof(device);
     bool found = false;
+    std::string target_device;
+    if (game_pid) {
+        GameWindowSearch search{game_pid, nullptr, 0};
+        EnumWindows(find_game_window, reinterpret_cast<LPARAM>(&search));
+        if (!search.window) { set_status(28, TweakStatus::Skipped); return; }
+        MONITORINFOEXA monitor{};
+        monitor.cbSize = sizeof(monitor);
+        if (GetMonitorInfoA(MonitorFromWindow(search.window, MONITOR_DEFAULTTONEAREST),
+                            &monitor))
+            target_device = monitor.szDevice;
+    }
     for (DWORD index = 0; EnumDisplayDevicesA(nullptr, index, &device, 0); ++index) {
-        if (device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) {
-            found = true;
-            break;
+        if ((!target_device.empty() && _stricmp(device.DeviceName, target_device.c_str()) == 0) ||
+            (target_device.empty() && (device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE))) {
+            found = true; break;
         }
         device = {};
         device.cb = sizeof(device);
@@ -1705,7 +2949,9 @@ void Optimizer::optimize_display_refresh()
     }
     _display_state = {device.DeviceName, current.dmDisplayFrequency,
                       current.dmPelsWidth, current.dmPelsHeight,
-                      current.dmBitsPerPel, best.dmDisplayFrequency};
+                      current.dmBitsPerPel, current.dmDisplayOrientation,
+                      current.dmDisplayFixedOutput, current.dmPosition.x,
+                      current.dmPosition.y, best.dmDisplayFrequency};
     if (!save_journal()) {
         _display_state = {};
         set_status(28, TweakStatus::Failed);
@@ -1743,6 +2989,10 @@ bool Optimizer::restore_display()
     if (current.dmPelsWidth == _display_state.width &&
         current.dmPelsHeight == _display_state.height &&
         current.dmBitsPerPel == _display_state.bits_per_pel &&
+        current.dmDisplayOrientation == _display_state.orientation &&
+        current.dmDisplayFixedOutput == _display_state.fixed_output &&
+        current.dmPosition.x == _display_state.position_x &&
+        current.dmPosition.y == _display_state.position_y &&
         current.dmDisplayFrequency == _display_state.frequency) {
         _display_state = {};
         return true;
@@ -1751,16 +3001,25 @@ bool Optimizer::restore_display()
         (current.dmPelsWidth != _display_state.width ||
          current.dmPelsHeight != _display_state.height ||
          current.dmBitsPerPel != _display_state.bits_per_pel ||
+         current.dmDisplayOrientation != _display_state.orientation ||
+         current.dmDisplayFixedOutput != _display_state.fixed_output ||
+         current.dmPosition.x != _display_state.position_x ||
+         current.dmPosition.y != _display_state.position_y ||
          current.dmDisplayFrequency != _display_state.applied_frequency))
         return false;
     DEVMODEA original{};
     original.dmSize = sizeof(original);
     original.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL |
-                        DM_DISPLAYFREQUENCY;
+                        DM_DISPLAYFREQUENCY | DM_DISPLAYORIENTATION |
+                        DM_DISPLAYFIXEDOUTPUT | DM_POSITION;
     original.dmPelsWidth = _display_state.width;
     original.dmPelsHeight = _display_state.height;
     original.dmBitsPerPel = _display_state.bits_per_pel;
     original.dmDisplayFrequency = _display_state.frequency;
+    original.dmDisplayOrientation = _display_state.orientation;
+    original.dmDisplayFixedOutput = _display_state.fixed_output;
+    original.dmPosition.x = _display_state.position_x;
+    original.dmPosition.y = _display_state.position_y;
     const bool okay = ChangeDisplaySettingsExA(
         _display_state.device.c_str(), &original, nullptr, CDS_TEST, nullptr) ==
         DISP_CHANGE_SUCCESSFUL &&
@@ -1803,9 +3062,21 @@ bool Optimizer::optimize(const std::string& game_path, bool launch_if_missing)
         _last_error = "Could not create recovery log";
         return false;
     }
+    if (!start_recovery_watchdog()) {
+        _last_error = "Could not start recovery watchdog";
+        DeleteFileA(_journal_path.c_str());
+        return false;
+    }
+    optimize_network(game_path.empty() ||
+                     (launch_if_missing && !is_game_active(game_path)));
+    if (_recovery_failed) {
+        _last_error = _restoration_status;
+        return false;
+    }
     const bool power_session_needed = enabled(0) || enabled(23) ||
                                       enabled(24) || enabled(25) ||
-                                      enabled(37) || enabled(38) || enabled(39);
+                                      enabled(37) || enabled(38) || enabled(39) ||
+                                      enabled(44);
     const bool power_session_ready = !power_session_needed ||
                                      begin_session_power_plan();
     if (_recovery_failed) {
@@ -1814,7 +3085,7 @@ bool Optimizer::optimize(const std::string& game_path, bool launch_if_missing)
     }
     if (!power_session_ready) {
         for (size_t index : {size_t(0), size_t(23), size_t(24), size_t(25),
-                             size_t(37), size_t(38), size_t(39)})
+                             size_t(37), size_t(38), size_t(39), size_t(44)})
             if (enabled(index))
                 set_status(index, TweakStatus::Failed);
         _failed.push_back("Temporary power plan unavailable");
@@ -1825,6 +3096,8 @@ bool Optimizer::optimize(const std::string& game_path, bool launch_if_missing)
         set_ac_power_setting(1, 0, 24, "AC PCIe link power saving off");
     if (power_session_ready && enabled(25))
         set_ac_power_setting(2, 1, 25, "AC CPU boost mode");
+    if (power_session_ready && enabled(44))
+        set_ac_power_setting(7, 100, 44, "AC CPU minimum: 100%");
     if (power_session_ready && enabled(37)) {
         set_ac_power_setting(3, 100, 37, "Core parking minimum");
         set_ac_power_setting(4, 100, 37, "Core parking efficiency class");
@@ -1833,7 +3106,7 @@ bool Optimizer::optimize(const std::string& game_path, bool launch_if_missing)
         set_ac_power_setting(5, 0, 38, "AC Wi-Fi performance");
     if (power_session_ready && enabled(39))
         set_ac_power_setting(6, 0, 39, "USB selective suspend off");
-    if (enabled(28))
+    if (enabled(28) && game_path.empty())
         optimize_display_refresh();
 
     if (enabled(1)) {
@@ -1900,6 +3173,9 @@ bool Optimizer::optimize(const std::string& game_path, bool launch_if_missing)
                   "VKMToggleGameBar", 0, "Game Bar shortcut off");
     if (enabled(40))
         optimize_accessibility_hotkeys();
+    optimize_input_tuning();
+    optimize_advanced_session();
+    tune_background_io();
 
     if (!is_admin())
         _failed.push_back("Administrator rights required for system tweaks");
@@ -1927,9 +3203,14 @@ void Optimizer::restore()
     }
     _waiting_for_game = false;
     _target_game_path.clear();
-    bool restored = restore_accessibility_hotkeys();
+    release_timer_resolution();
+    bool restored = restore_input_tuning();
+    restored = restore_accessibility_hotkeys() && restored;
+    restored = restore_advanced_processes() && restored;
+    restored = restore_services() && restored;
     restored = restore_background_processes() && restored;
     restored = restore_registry() && restored;
+    restored = restore_network() && restored;
     if (_session_power_plan_guid.empty())
         restored = restore_ac_power_settings() && restored;
     else
@@ -1998,11 +3279,14 @@ bool Optimizer::find_target_process()
     _game_process = candidate;
     _game_pid = pid;
     _waiting_for_game = false;
+    if (enabled(28) && _display_state.device.empty())
+        optimize_display_refresh(pid);
 
     HANDLE tune = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
                               PROCESS_SET_INFORMATION | SYNCHRONIZE, FALSE, pid);
     const bool tracked = tune && track_process_for_restore(tune, pid);
     tune_game_process(tune, tracked);
+    tune_advanced_game_process(tune, pid);
     if (tune)
         CloseHandle(tune);
     return true;
@@ -2021,10 +3305,13 @@ bool Optimizer::is_game_running()
     DWORD exit_code = 0;
     const bool running = GetExitCodeProcess(_game_process, &exit_code) &&
                          exit_code == STILL_ACTIVE;
-    if (running && GetTickCount64() - _last_helper_scan >= 5000) {
+    if (running && GetTickCount64() - _last_helper_scan >= 15000) {
         _last_helper_scan = GetTickCount64();
         throttle_background_processes();
+        tune_background_io();
     }
+    if (running && enabled(28) && _display_state.device.empty())
+        optimize_display_refresh(_game_pid);
     return running;
 }
 

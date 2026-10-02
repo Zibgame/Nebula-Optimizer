@@ -3,6 +3,7 @@
 #include <array>
 #include <string>
 #include "json.hpp"
+#include "tweak_catalog.hpp"
 
 // Durable settings are deliberately separate from the session recovery journal.
 // A saved setting is never silently re-applied after an external change.
@@ -39,16 +40,16 @@ private:
     bool perform(size_t index, const std::string& game_path, bool confirmed,
                  bool (*confirm_display)());
     bool rollback(const json& operation);
-    bool import_base_settings(const std::array<json, 41>& targets,
-                              const std::array<json, 41>& values,
-                              const std::array<bool, 41>& known);
+    bool import_base_settings(const std::array<json, TWEAK_COUNT>& targets,
+                              const std::array<json, TWEAK_COUNT>& values,
+                              const std::array<bool, TWEAK_COUNT>& known);
     void refresh_saved(const std::string& game_path);
 
     std::string _scan_path, _saved_path, _dismissed_path, _operation_path;
     json _scan = json::object();
     json _saved = json::object();
     json _dismissed = json::object();
-    std::array<Info, 41> _info{};
+    std::array<Info, TWEAK_COUNT> _info{};
     bool _blocked = false;
     std::string _error;
 };

@@ -1,3 +1,4 @@
+#include <winsock2.h>
 #include "saved_tweaks.hpp"
 
 #include <algorithm>
@@ -6,27 +7,17 @@
 #include <fstream>
 #include <stdexcept>
 #include <vector>
+#include <chrono>
 #include <windows.h>
 #include <powrprof.h>
 #include <objbase.h>
+#include <iphlpapi.h>
+#include <ws2tcpip.h>
+#include <cfgmgr32.h>
 
 namespace {
 using json = nlohmann::json;
-constexpr const char* ids[41] = {
-    "power_plan", "prevent_sleep", "game_dvr", "background_capture",
-    "game_bar_popup", "game_mode", "mmcss_network", "mmcss_reserve",
-    "mmcss_priority", "mmcss_scheduling", "foreground_cpu",
-    "background_onedrive", "gpu_preference", "game_ecoqos", "game_priority",
-    "game_bar_controller", "recording_hotkey", "history_hotkey",
-    "game_bar_hotkey", "background_indexer", "background_widgets",
-    "background_phone_link", "background_adobe", "ac_cpu_epp",
-    "ac_pcie_aspm", "ac_cpu_boost", "game_dynamic_boost",
-    "game_memory_normal", "display_max_refresh", "memory_cloud",
-    "memory_indexer", "memory_widgets", "memory_phone_link",
-    "memory_adobe", "updater_cpu", "updater_ecoqos",
-    "updater_memory", "ac_core_parking", "ac_wifi_performance",
-    "diagnostic_usb_suspend", "accessibility_hotkeys"
-};
+const char* tweak_id(size_t index) { return TWEAK_CATALOG[index].id; }
 constexpr const char* profile =
     "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile";
 constexpr const char* games =
@@ -44,7 +35,8 @@ constexpr GUID settings[] = {
     {0x0cc5b647,0xc1df,0x4637,{0x89,0x1a,0xde,0xc3,0x5c,0x31,0x85,0x83}},
     {0x0cc5b647,0xc1df,0x4637,{0x89,0x1a,0xde,0xc3,0x5c,0x31,0x85,0x84}},
     {0x12bbebe6,0x58d6,0x4636,{0x95,0xbb,0x32,0x17,0xef,0x86,0x7c,0x1a}},
-    {0x48e6b7a6,0x50f5,0x4782,{0xa5,0xd4,0x53,0xbb,0x8f,0x07,0xe2,0x26}}
+    {0x48e6b7a6,0x50f5,0x4782,{0xa5,0xd4,0x53,0xbb,0x8f,0x07,0xe2,0x26}},
+    {0x893dee8e,0x2bef,0x41e0,{0x89,0xc6,0xb5,0x5d,0x09,0x29,0x96,0x4c}}
 };
 const GUID& group(unsigned kind) {
     return kind == 1 ? pcie_group : kind == 5 ? wifi_group :
@@ -154,6 +146,219 @@ bool safe_accessibility_partial(const json& target, const json& current) {
             return false;
     return true;
 }
+
+struct SavedAdapter {
+    GUID id{};
+    DWORD index=0;
+    ULONG type=0;
+    std::string path;
+    std::string instance;
+};
+
+bool registry_text(const std::string& path,const char* name,std::string& value) {
+    HKEY key=nullptr;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,path.c_str(),0,KEY_QUERY_VALUE,&key)!=ERROR_SUCCESS)
+        return false;
+    DWORD type=0,size=0;
+    LONG result=RegQueryValueExA(key,name,nullptr,&type,nullptr,&size);
+    if (result!=ERROR_SUCCESS || (type!=REG_SZ && type!=REG_EXPAND_SZ)) {
+        RegCloseKey(key); return false;
+    }
+    std::vector<char> data(size+1,0);
+    result=RegQueryValueExA(key,name,nullptr,&type,
+        reinterpret_cast<BYTE*>(data.data()),&size);
+    RegCloseKey(key);
+    if (result!=ERROR_SUCCESS) return false;
+    value=data.data(); return true;
+}
+
+bool saved_active_adapter(SavedAdapter& out) {
+    if (GetBestInterface(inet_addr("1.1.1.1"),&out.index)!=NO_ERROR) return false;
+    ULONG bytes=0;
+    GetAdaptersAddresses(AF_UNSPEC,0,nullptr,nullptr,&bytes);
+    std::vector<unsigned char> storage(bytes);
+    auto* first=reinterpret_cast<PIP_ADAPTER_ADDRESSES>(storage.data());
+    if (!bytes || GetAdaptersAddresses(AF_UNSPEC,0,nullptr,first,&bytes)!=NO_ERROR)
+        return false;
+    std::string adapter_name;
+    for (auto* item=first;item;item=item->Next)
+        if (item->IfIndex==out.index || item->Ipv6IfIndex==out.index) {
+            adapter_name=item->AdapterName ? item->AdapterName : "";
+            out.type=item->IfType; break;
+        }
+    if (adapter_name.empty()) return false;
+    std::wstring wide(adapter_name.begin(),adapter_name.end());
+    if (wide.empty() || wide.front()!=L'{') wide=L"{"+wide+L"}";
+    if (CLSIDFromString(wide.c_str(),&out.id)!=S_OK) return false;
+    const std::string base=
+        "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}";
+    HKEY root=nullptr;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,base.c_str(),0,KEY_ENUMERATE_SUB_KEYS,&root)
+        !=ERROR_SUCCESS) return false;
+    for (DWORD number=0;;++number) {
+        char name[256]{}; DWORD length=sizeof(name);
+        if (RegEnumKeyExA(root,number,name,&length,nullptr,nullptr,nullptr,nullptr)
+            !=ERROR_SUCCESS) break;
+        const std::string path=base+"\\"+name;
+        std::string id;
+        if (registry_text(path,"NetCfgInstanceId",id) &&
+            _stricmp(id.c_str(),adapter_name.c_str())==0) {
+            out.path=path; registry_text(path,"PnPInstanceID",out.instance); break;
+        }
+    }
+    RegCloseKey(root); return !out.path.empty();
+}
+
+std::string lower_text(std::string value) {
+    std::transform(value.begin(),value.end(),value.begin(),
+        [](unsigned char c){return static_cast<char>(std::tolower(c));});
+    return value;
+}
+
+bool saved_driver_value(const SavedAdapter& adapter,const char* keyword,
+                        const std::vector<std::string>& wanted,json& target) {
+    const std::string enum_path=adapter.path+"\\Ndi\\Params\\"+keyword+"\\enum";
+    HKEY values=nullptr;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,enum_path.c_str(),0,KEY_QUERY_VALUE,&values)
+        !=ERROR_SUCCESS) return false;
+    std::string selected;
+    for (DWORD index=0;selected.empty();++index) {
+        char name[128]{}; DWORD name_size=sizeof(name);
+        BYTE data[512]{}; DWORD data_size=sizeof(data),type=0;
+        if (RegEnumValueA(values,index,name,&name_size,nullptr,&type,data,&data_size)
+            !=ERROR_SUCCESS) break;
+        if (type!=REG_SZ) continue;
+        const std::string display=lower_text(reinterpret_cast<char*>(data));
+        for (const auto& token:wanted)
+            if (display.find(lower_text(token))!=std::string::npos) {
+                selected.assign(name,name_size); break;
+            }
+    }
+    RegCloseKey(values);
+    if (selected.empty()) return false;
+    HKEY key=nullptr; DWORD type=0,size=0;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,adapter.path.c_str(),0,KEY_QUERY_VALUE,&key)
+        !=ERROR_SUCCESS) return false;
+    const LONG read=RegQueryValueExA(key,keyword,nullptr,&type,nullptr,&size);
+    RegCloseKey(key);
+    if (read!=ERROR_SUCCESS) return false;
+    target=type==REG_DWORD ? dword("HKLM",adapter.path.c_str(),keyword,
+        std::strtoul(selected.c_str(),nullptr,0)) :
+        string_value("HKLM",adapter.path.c_str(),keyword,selected);
+    target["network_device"]=adapter.instance;
+    return true;
+}
+
+bool restart_saved_adapter(const std::string& instance) {
+    if (instance.empty()) return false;
+    std::vector<char> id(instance.begin(),instance.end()); id.push_back('\0');
+    DEVINST device=0;
+    if (CM_Locate_DevNodeA(&device,id.data(),CM_LOCATE_DEVNODE_NORMAL)!=CR_SUCCESS ||
+        CM_Disable_DevNode(device,0)!=CR_SUCCESS) return false;
+    Sleep(300);
+    return CM_Enable_DevNode(device,0)==CR_SUCCESS;
+}
+
+struct SavedDnsSettings {
+    ULONG Version; ULONG64 Flags; PWSTR Domain; PWSTR NameServer;
+    PWSTR SearchList; ULONG RegistrationEnabled; ULONG RegisterAdapterName;
+    ULONG EnableLLMNR; ULONG QueryAdapterName; PWSTR ProfileNameServer;
+};
+using GetDnsFn=DWORD (WINAPI*)(GUID,SavedDnsSettings*);
+using SetDnsFn=DWORD (WINAPI*)(GUID,const SavedDnsSettings*);
+using FreeDnsFn=VOID (WINAPI*)(SavedDnsSettings*);
+template<class Function> Function dns_function(const char* name) {
+    HMODULE module=GetModuleHandleA("iphlpapi.dll");
+    FARPROC address=module ? GetProcAddress(module,name) : nullptr;
+    Function function=nullptr;
+    static_assert(sizeof(function)==sizeof(address));
+    std::memcpy(&function,&address,sizeof(function)); return function;
+}
+bool get_dns(const GUID& id,std::wstring& servers) {
+    auto get=dns_function<GetDnsFn>("GetInterfaceDnsSettings");
+    auto release=dns_function<FreeDnsFn>("FreeInterfaceDnsSettings");
+    if (!get || !release) return false;
+    SavedDnsSettings settings{}; settings.Version=1;
+    if (get(id,&settings)!=NO_ERROR) return false;
+    servers=settings.NameServer ? settings.NameServer : L"";
+    release(&settings); return true;
+}
+bool set_dns(const GUID& id,const std::wstring& servers) {
+    auto set=dns_function<SetDnsFn>("SetInterfaceDnsSettings");
+    if (!set) return false;
+    SavedDnsSettings settings{}; settings.Version=1; settings.Flags=0x0002;
+    settings.NameServer=servers.empty() ? nullptr : const_cast<PWSTR>(servers.c_str());
+    return set(id,&settings)==NO_ERROR;
+}
+std::string utf8(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int size=WideCharToMultiByte(CP_UTF8,0,value.c_str(),
+        static_cast<int>(value.size()),nullptr,0,nullptr,nullptr);
+    std::string result(size,'\0');
+    WideCharToMultiByte(CP_UTF8,0,value.c_str(),static_cast<int>(value.size()),
+        result.data(),size,nullptr,nullptr); return result;
+}
+std::wstring wide_utf8(const std::string& value) {
+    if (value.empty()) return {};
+    const int size=MultiByteToWideChar(CP_UTF8,0,value.c_str(),
+        static_cast<int>(value.size()),nullptr,0);
+    std::wstring result(size,L'\0');
+    MultiByteToWideChar(CP_UTF8,0,value.c_str(),static_cast<int>(value.size()),
+        result.data(),size); return result;
+}
+int saved_dns_latency(const char* server) {
+    sockaddr_in target{}; target.sin_family=AF_INET; target.sin_port=htons(53);
+    if (inet_pton(AF_INET,server,&target.sin_addr)!=1) return -1;
+    std::vector<int> samples;
+    for (unsigned attempt=0;attempt<3;++attempt) {
+        SOCKET handle=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+        if (handle==INVALID_SOCKET) break;
+        DWORD timeout=500;
+        setsockopt(handle,SOL_SOCKET,SO_RCVTIMEO,
+            reinterpret_cast<const char*>(&timeout),sizeof(timeout));
+        unsigned char query[64]{}; const USHORT transaction=
+            static_cast<USHORT>((GetTickCount()+attempt*3571)&0xffff);
+        query[0]=static_cast<unsigned char>(transaction>>8);
+        query[1]=static_cast<unsigned char>(transaction); query[2]=1; query[5]=1;
+        size_t position=12;
+        for (const char* label:{"www","epicgames","com"}) {
+            const size_t length=std::strlen(label); query[position++]=length;
+            std::memcpy(query+position,label,length); position+=length;
+        }
+        query[position++]=0; query[position++]=0; query[position++]=1;
+        query[position++]=0; query[position++]=1;
+        const auto start=std::chrono::steady_clock::now();
+        const int sent=sendto(handle,reinterpret_cast<const char*>(query),position,0,
+            reinterpret_cast<const sockaddr*>(&target),sizeof(target));
+        unsigned char response[512]{}; int from_size=sizeof(target);
+        const int received=sent>0 ? recvfrom(handle,reinterpret_cast<char*>(response),
+            sizeof(response),0,reinterpret_cast<sockaddr*>(&target),&from_size) : -1;
+        const auto stop=std::chrono::steady_clock::now(); closesocket(handle);
+        if (received>=12 && response[0]==query[0] && response[1]==query[1])
+            samples.push_back(std::chrono::duration_cast<std::chrono::milliseconds>(
+                stop-start).count());
+    }
+    if (samples.size()<2) return -1;
+    std::sort(samples.begin(),samples.end()); return samples[samples.size()/2];
+}
+std::string saved_effective_dns(DWORD interface_index) {
+    ULONG bytes=0; GetAdaptersAddresses(AF_UNSPEC,0,nullptr,nullptr,&bytes);
+    std::vector<unsigned char> storage(bytes);
+    auto* first=reinterpret_cast<PIP_ADAPTER_ADDRESSES>(storage.data());
+    if (!bytes || GetAdaptersAddresses(AF_UNSPEC,0,nullptr,first,&bytes)!=NO_ERROR)
+        return {};
+    for (auto* item=first;item;item=item->Next) {
+        if (item->IfIndex!=interface_index && item->Ipv6IfIndex!=interface_index) continue;
+        for (auto* dns=item->FirstDnsServerAddress;dns;dns=dns->Next) {
+            if (!dns->Address.lpSockaddr || dns->Address.lpSockaddr->sa_family!=AF_INET)
+                continue;
+            char host[NI_MAXHOST]{};
+            if (getnameinfo(dns->Address.lpSockaddr,dns->Address.iSockaddrLength,
+                host,sizeof(host),nullptr,0,NI_NUMERICHOST)==0) return host;
+        }
+    }
+    return {};
+}
 } // namespace
 
 SavedTweaks::SavedTweaks(const std::string& directory)
@@ -162,11 +367,37 @@ SavedTweaks::SavedTweaks(const std::string& directory)
       _dismissed_path(directory+"\\saved-dismissed.json"),
       _operation_path(directory+"\\saved-operation.json") {
     load();
+    // One-time cleanup for the short-lived build that exposed mouse
+    // acceleration as a Saved tweak. Restore only when the current value is
+    // still exactly the value Nebula wrote; never overwrite a third-party edit.
+    if (!_blocked && _saved.contains("mouse_acceleration_off")) {
+        bool safe=true;
+        try {
+            for (const auto& target:_saved.at("mouse_acceleration_off").at("targets")) {
+                json current;
+                if (!read_target(target,current)) {safe=false; break;}
+                if (equal_value(target,current,target.at("before"))) continue;
+                if (!equal_value(target,current,target.at("desired")) ||
+                    !write_target(target,target.at("before"),nullptr)) {
+                    safe=false; break;
+                }
+            }
+        } catch (...) {safe=false;}
+        if (safe) {
+            _saved.erase("mouse_acceleration_off");
+            _scan.erase("mouse_acceleration_off");
+            _dismissed.erase("mouse_acceleration_off");
+            safe=write(_saved_path,_saved) && write(_scan_path,_scan) &&
+                 write(_dismissed_path,_dismissed);
+        }
+        if (!safe) {
+            _blocked=true;
+            _error="Legacy mouse restore conflicts with an external change";
+        }
+    }
     for (size_t i=0;i<_info.size();++i) {
-        _info[i].eligible = (i>=2 && i<=10) || i==12 ||
-            (i>=15 && i<=18) || (i>=23 && i<=25) || i==28 ||
-            (i>=37 && i<=40);
-        _info[i].saved = _saved.contains(ids[i]);
+        _info[i].eligible = TWEAK_CATALOG[i].saved_eligible;
+        _info[i].saved = _saved.contains(tweak_id(i));
     }
 }
 
@@ -198,7 +429,7 @@ bool SavedTweaks::write(const std::string& path, const json& data) const {
 
 bool SavedTweaks::targets(size_t index, const std::string& game_path, json& out) const {
     out=json::array();
-    if (index>=41 || !_info[index].eligible) return false;
+    if (index>=TWEAK_COUNT || !_info[index].eligible) return false;
     const char* user="HKCU"; const char* machine="HKLM";
     switch(index) {
     case 2: out.push_back(dword(user,"System\\GameConfigStore","GameDVR_Enabled",0)); break;
@@ -223,7 +454,7 @@ bool SavedTweaks::targets(size_t index, const std::string& game_path, json& out)
     case 16: out.push_back(dword(user,gamedvr,"VKMToggleRecording",0)); break;
     case 17: out.push_back(dword(user,gamedvr,"VKMSaveHistoricalVideo",0)); break;
     case 18: out.push_back(dword(user,gamedvr,"VKMToggleGameBar",0)); break;
-    case 23: case 24: case 25: case 37: case 38: case 39: {
+    case 23: case 24: case 25: case 37: case 38: case 39: case 44: {
         GUID* active=nullptr;
         if (PowerGetActiveScheme(nullptr,&active)!=ERROR_SUCCESS || !active) return false;
         const std::string scheme=guid_string(*active); LocalFree(active);
@@ -234,6 +465,7 @@ bool SavedTweaks::targets(size_t index, const std::string& game_path, json& out)
         if (index==37) {out.push_back(power(3,100,scheme)); out.push_back(power(4,100,scheme));}
         if (index==38) out.push_back(power(5,0,scheme));
         if (index==39) out.push_back(power(6,0,scheme));
+        if (index==44) out.push_back(power(7,100,scheme));
         break;
     }
     case 28: {
@@ -253,7 +485,73 @@ bool SavedTweaks::targets(size_t index, const std::string& game_path, json& out)
         out.push_back({{"kind","display"},{"device",name},
                        {"desired",display_mode(best)}}); break;
     }
-    case 40: out.push_back({{"kind","accessibility"},{"desired",json::object()}}); break;
+    case 40: case 41:
+        out.push_back({{"kind","accessibility"},{"desired",json::object()}}); break;
+    case 42: out.push_back({{"kind","keyboard"},{"setting","delay"},
+                            {"desired",{{"value",0}}}}); break;
+    case 43: out.push_back({{"kind","keyboard"},{"setting","speed"},
+                            {"desired",{{"value",31}}}}); break;
+    case 45: {
+        SavedAdapter adapter;
+        if (!saved_active_adapter(adapter)) return false;
+        std::wstring original;
+        if (!get_dns(adapter.id,original)) return false;
+        WSADATA winsock{};
+        if (WSAStartup(MAKEWORD(2,2),&winsock)!=0) return false;
+        const std::string current=saved_effective_dns(adapter.index);
+        int best=current.empty() ? -1 : saved_dns_latency(current.c_str());
+        std::wstring desired=original;
+        for (const auto& candidate:std::vector<std::pair<const char*,const wchar_t*>>{
+                {"1.1.1.1",L"1.1.1.1,1.0.0.1"},
+                {"8.8.8.8",L"8.8.8.8,8.8.4.4"},
+                {"9.9.9.9",L"9.9.9.9,149.112.112.112"}}) {
+            const int latency=saved_dns_latency(candidate.first);
+            if (latency>=0 && (best<0 || latency<best)) {
+                best=latency; desired=candidate.second;
+            }
+        }
+        WSACleanup();
+        if (best<0) return false;
+        out.push_back({{"kind","dns"},{"interface",guid_string(adapter.id)},
+                       {"desired",{{"servers",utf8(desired)}}}}); break;
+    }
+    case 46: case 47: case 48: case 49: case 50:
+    case 51: case 52: case 53: {
+        SavedAdapter adapter;
+        if (!saved_active_adapter(adapter)) return false;
+        if (index>=46 && index<=50 && adapter.type!=IF_TYPE_ETHERNET_CSMACD)
+            return false;
+        if ((index==52 || index==53) && adapter.type!=IF_TYPE_IEEE80211)
+            return false;
+        struct Choice { const char* key; std::vector<std::string> values; };
+        std::vector<Choice> choices;
+        if (index==46) choices={{"*RSS",{"enabled","on"}}};
+        if (index==47) choices={{"*InterruptModeration",{"disabled","off"}},
+                                {"InterruptModeration",{"disabled","off"}}};
+        if (index==48) choices={{"*RscIPv4",{"disabled","off"}},
+                                {"*RscIPv6",{"disabled","off"}},
+                                {"RSC",{"disabled","off"}}};
+        if (index==49) choices={{"*EEE",{"disabled","off"}},
+                                {"EEELinkAdvertisement",{"disabled","off"}},
+                                {"AdvancedEEE",{"disabled","off"}},
+                                {"EnableGreenEthernet",{"disabled","off"}}};
+        if (index==50) choices={{"*FlowControl",{"disabled","off"}},
+                                {"FlowControl",{"disabled","off"}}};
+        if (index==51) choices={{"PowerSavingMode",{"disabled","maximum performance","off"}},
+                                {"PowerSaveMode",{"disabled","maximum performance","off"}}};
+        if (index==52) choices={{"MIMOPowerSaveMode",{"no smps"}},
+                                {"MimoPowerSaveMode",{"no smps"}}};
+        if (index==53) choices={{"TransmitPower",{"highest","maximum"}},
+                                {"*TransmitPower",{"highest","maximum"}}};
+        json target;
+        bool found=false;
+        for (const Choice& choice:choices)
+            if (saved_driver_value(adapter,choice.key,choice.values,target)) {
+                found=true; break;
+            }
+        if (!found) return false;
+        out.push_back(target); break;
+    }
     default: return false;
     }
     return !out.empty();
@@ -262,6 +560,13 @@ bool SavedTweaks::targets(size_t index, const std::string& game_path, json& out)
 bool SavedTweaks::read_target(const json& target, json& value) const {
     try {
         const std::string kind=target.at("kind").get<std::string>();
+        if (kind=="dns") {
+            GUID id{};
+            if (!parse_guid(target.at("interface").get<std::string>(),id)) return false;
+            std::wstring servers;
+            if (!get_dns(id,servers)) return false;
+            value={{"servers",utf8(servers)}}; return true;
+        }
         if (kind=="registry") {
             HKEY root=target.at("root")=="HKLM" ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
             HKEY key=nullptr;
@@ -313,6 +618,21 @@ bool SavedTweaks::read_target(const json& target, json& value) const {
                    {"toggle_flags",toggle.dwFlags}};
             return true;
         }
+        if (kind=="keyboard") {
+            UINT setting=0;
+            const std::string name=target.at("setting").get<std::string>();
+            const UINT action=name=="delay" ? SPI_GETKEYBOARDDELAY :
+                              name=="speed" ? SPI_GETKEYBOARDSPEED : 0;
+            if (!action || !SystemParametersInfoW(action,0,&setting,0)) return false;
+            value={{"value",setting}}; return true;
+        }
+        if (kind=="mouse_acceleration") {
+            int mouse[3]{};
+            if (!SystemParametersInfoW(SPI_GETMOUSE,0,mouse,0)) return false;
+            value={{"threshold1",mouse[0]},{"threshold2",mouse[1]},
+                   {"acceleration",mouse[2]}};
+            return true;
+        }
     } catch (...) { return false; }
     return false;
 }
@@ -321,6 +641,11 @@ bool SavedTweaks::write_target(const json& target, const json& value,
                                bool (*confirm_display)()) const {
     try {
         const std::string kind=target.at("kind").get<std::string>();
+        if (kind=="dns") {
+            GUID id{};
+            if (!parse_guid(target.at("interface").get<std::string>(),id)) return false;
+            return set_dns(id,wide_utf8(value.at("servers").get<std::string>()));
+        }
         if (kind=="registry") {
             HKEY root=target.at("root")=="HKLM" ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
             HKEY key=nullptr;
@@ -338,7 +663,13 @@ bool SavedTweaks::write_target(const json& target, const json& value,
                                       bytes.data(),static_cast<DWORD>(bytes.size()));
             } else result=RegDeleteValueA(key,name.c_str());
             RegCloseKey(key);
-            return result==ERROR_SUCCESS || (!exists && result==ERROR_FILE_NOT_FOUND);
+            const bool written=result==ERROR_SUCCESS ||
+                (!exists && result==ERROR_FILE_NOT_FOUND);
+            if (!written) return false;
+            if (target.contains("network_device"))
+                return restart_saved_adapter(
+                    target.at("network_device").get<std::string>());
+            return true;
         }
         if (kind=="power") {
             GUID scheme{};
@@ -382,6 +713,21 @@ bool SavedTweaks::write_target(const json& target, const json& value,
                    SystemParametersInfoW(SPI_SETSTICKYKEYS,sizeof(s),&s,flags) &&
                    SystemParametersInfoW(SPI_SETTOGGLEKEYS,sizeof(t),&t,flags);
         }
+        if (kind=="keyboard") {
+            const std::string name=target.at("setting").get<std::string>();
+            const UINT action=name=="delay" ? SPI_SETKEYBOARDDELAY :
+                              name=="speed" ? SPI_SETKEYBOARDSPEED : 0;
+            return action && SystemParametersInfoW(action,
+                value.at("value").get<UINT>(),nullptr,
+                SPIF_UPDATEINIFILE|SPIF_SENDCHANGE);
+        }
+        if (kind=="mouse_acceleration") {
+            int mouse[3] = {value.at("threshold1").get<int>(),
+                            value.at("threshold2").get<int>(),
+                            value.at("acceleration").get<int>()};
+            return SystemParametersInfoW(SPI_SETMOUSE,0,mouse,
+                                         SPIF_UPDATEINIFILE|SPIF_SENDCHANGE);
+        }
     } catch (...) { return false; }
     return false;
 }
@@ -392,9 +738,9 @@ SavedTweaks::Info SavedTweaks::info(size_t index) const {
 
 bool SavedTweaks::scan(const std::string& game_path) {
     if (_blocked) return false;
-    std::array<json,41> observed_targets{};
-    std::array<json,41> observed_values{};
-    std::array<bool,41> observed_known{};
+    std::array<json,TWEAK_COUNT> observed_targets{};
+    std::array<json,TWEAK_COUNT> observed_values{};
+    std::array<bool,TWEAK_COUNT> observed_known{};
     for (size_t i=0;i<_info.size();++i) {
         if (!_info[i].eligible) continue;
         json target;
@@ -418,18 +764,28 @@ bool SavedTweaks::scan(const std::string& game_path) {
             desired["toggle_flags"]=flags;
             target[0]["desired"]=desired;
         }
+        if (known && i==41) {
+            json desired=values[0];
+            desired["filter_flags"]=(desired.at("filter_flags").get<DWORD>() |
+                FKF_FILTERKEYSON) & ~(FKF_HOTKEYACTIVE|FKF_CONFIRMHOTKEY);
+            desired["filter_wait"]=1;
+            desired["filter_delay"]=100;
+            desired["filter_repeat"]=20;
+            desired["filter_bounce"]=0;
+            target[0]["desired"]=desired;
+        }
         observed_targets[i]=target;
         observed_values[i]=values;
         observed_known[i]=known;
-        if (!_scan.contains(ids[i]))
-            _scan[ids[i]]["first"]=known ? values : json(nullptr);
-        if (known && (!_scan[ids[i]].contains("first_known") ||
-                      _scan[ids[i]]["first_known"].is_null()))
-            _scan[ids[i]]["first_known"]=values;
-        _scan[ids[i]]["last"]=known ? values : json(nullptr);
+        if (!_scan.contains(tweak_id(i)))
+            _scan[tweak_id(i)]["first"]=known ? values : json(nullptr);
+        if (known && (!_scan[tweak_id(i)].contains("first_known") ||
+                      _scan[tweak_id(i)]["first_known"].is_null()))
+            _scan[tweak_id(i)]["first_known"]=values;
+        _scan[tweak_id(i)]["last"]=known ? values : json(nullptr);
         _info[i].unknown=!known;
-        const json& reference=_scan[ids[i]].contains("first_known") ?
-            _scan[ids[i]]["first_known"] : _scan[ids[i]]["first"];
+        const json& reference=_scan[tweak_id(i)].contains("first_known") ?
+            _scan[tweak_id(i)]["first_known"] : _scan[tweak_id(i)]["first"];
         _info[i].base=known && reference.is_array() &&
                       reference.size()==target.size();
         if (_info[i].base) for (size_t n=0;n<target.size();++n)
@@ -446,22 +802,24 @@ bool SavedTweaks::scan(const std::string& game_path) {
 }
 
 bool SavedTweaks::import_base_settings(
-    const std::array<json,41>& target_lists,
-    const std::array<json,41>& values,
-    const std::array<bool,41>& known)
+    const std::array<json,TWEAK_COUNT>& target_lists,
+    const std::array<json,TWEAK_COUNT>& values,
+    const std::array<bool,TWEAK_COUNT>& known)
 {
     json updated=_saved;
     bool changed=false;
     for (size_t i=0;i<_info.size();++i) {
         if (!_info[i].eligible || !known[i] || !_info[i].base ||
-            updated.contains(ids[i]) || _dismissed.value(ids[i],false)) continue;
-        if (i==40) {
+            updated.contains(tweak_id(i)) || _dismissed.value(tweak_id(i),false)) continue;
+        if (i==40 || i==41) {
             const auto& state=values[i][0];
-            if ((state.at("filter_flags").get<DWORD>() & FKF_FILTERKEYSON) ||
+            if ((i==40 && (state.at("filter_flags").get<DWORD>() & FKF_FILTERKEYSON)) ||
                 (state.at("sticky_flags").get<DWORD>() & SKF_STICKYKEYSON) ||
                 (state.at("toggle_flags").get<DWORD>() & TKF_TOGGLEKEYSON))
                 continue; // A deliberately active accessibility feature is not an optimization.
         }
+        if ((i==40 && updated.contains(tweak_id(41))) ||
+            (i==41 && updated.contains(tweak_id(40)))) continue;
         const json& targets=target_lists[i];
         bool still_optimal=targets.is_array() && targets.size()==values[i].size();
         for (size_t n=0;still_optimal && n<targets.size();++n)
@@ -473,7 +831,7 @@ bool SavedTweaks::import_base_settings(
             item["before"]=values[i][n];
             entries.push_back(item);
         }
-        updated[ids[i]]={{"targets",entries},{"source","base_scan"}};
+        updated[tweak_id(i)]={{"targets",entries},{"source","base_scan"}};
         changed=true;
     }
     if (!changed) return true;
@@ -487,11 +845,11 @@ bool SavedTweaks::import_base_settings(
 
 void SavedTweaks::refresh_saved(const std::string&) {
     for (size_t i=0;i<_info.size();++i) {
-        _info[i].saved=_saved.contains(ids[i]);
+        _info[i].saved=_saved.contains(tweak_id(i));
         _info[i].drift=false;
         if (!_info[i].saved) continue;
         try {
-            const json& entries=_saved.at(ids[i]).at("targets");
+            const json& entries=_saved.at(tweak_id(i)).at("targets");
             for (const auto& item:entries) {
                 json actual;
                 if (!read_target(item,actual) ||
@@ -560,9 +918,14 @@ bool SavedTweaks::recover() {
 
 bool SavedTweaks::perform(size_t index, const std::string& game_path,
                           bool confirmed, bool (*confirm_display)()) {
-    if (_blocked || index>=41 || !_info[index].eligible) return false;
-    if ((index==28 || index==37 || index==39 || index==40) && !confirmed) {
+    if (_blocked || index>=TWEAK_COUNT || !_info[index].eligible) return false;
+    if ((index==28 || index==37 || index==39 || index==40 ||
+         index==41 || index==44 || (index>=47 && index<=50)) && !confirmed) {
         _error="Confirmation required"; return false;
+    }
+    if ((index==40 && _saved.contains(tweak_id(41))) ||
+        (index==41 && _saved.contains(tweak_id(40)))) {
+        _error="Remove the conflicting Saved accessibility tweak first"; return false;
     }
     json entries;
     if (!targets(index,game_path,entries)) { _error="Target unavailable"; return false; }
@@ -584,12 +947,26 @@ bool SavedTweaks::perform(size_t index, const std::string& game_path,
             desired["toggle_flags"]=flags;
             item["desired"]=desired;
         }
+        if (index==41) {
+            json desired=before;
+            DWORD flags=before.at("filter_flags").get<DWORD>();
+            desired["filter_flags"]=(flags|FKF_FILTERKEYSON) &
+                ~(FKF_HOTKEYACTIVE|FKF_CONFIRMHOTKEY);
+            desired["filter_wait"]=1;
+            desired["filter_delay"]=100;
+            desired["filter_repeat"]=20;
+            desired["filter_bounce"]=0;
+            if ((flags & FKF_FILTERKEYSON) && before!=desired) {
+                _error="FilterKeys is already in use"; return false;
+            }
+            item["desired"]=desired;
+        }
         if (index==25 && before.at("value").get<DWORD>()!=0 &&
             !equal_value(item,before,item.at("desired"))) {
             _error="CPU boost has a custom mode"; return false;
         }
     }
-    json operation={{"id",ids[index]},{"targets",entries},
+    json operation={{"id",tweak_id(index)},{"targets",entries},
                     {"ready_to_commit",false}};
     if (!write(_operation_path,operation)) { _error="Cannot create saved transaction"; return false; }
     for (const auto& item:entries) {
@@ -616,7 +993,7 @@ bool SavedTweaks::perform(size_t index, const std::string& game_path,
         _blocked=true; _error="Could not finalize saved transaction"; return false;
     }
     json updated=_saved;
-    updated[ids[index]]={{"targets",entries}};
+    updated[tweak_id(index)]={{"targets",entries}};
     if (!write(_saved_path,updated)) {
         _blocked=true; _error="Saved setting applied but commit failed"; return false;
     }
@@ -630,23 +1007,24 @@ bool SavedTweaks::perform(size_t index, const std::string& game_path,
 
 bool SavedTweaks::apply(size_t index, const std::string& game_path,
                         bool confirmed, bool (*confirm_display)()) {
-    if (index>=41 || _saved.contains(ids[index])) return false;
+    if (index>=TWEAK_COUNT || _saved.contains(tweak_id(index))) return false;
     return perform(index,game_path,confirmed,confirm_display);
 }
 bool SavedTweaks::reapply(size_t index, const std::string& game_path,
                           bool confirmed, bool (*confirm_display)()) {
-    if (index>=41 || !_saved.contains(ids[index])) return false;
+    if (index>=TWEAK_COUNT || !_saved.contains(tweak_id(index))) return false;
     // Preserve the original target identity (game path, power scheme, display).
     try {
-        json entries=_saved.at(ids[index]).at("targets");
+        json entries=_saved.at(tweak_id(index)).at("targets");
         for (auto& item:entries) {
             json before;
             if (!read_target(item,before)) return false;
             item["before"]=before;
         }
-        if ((index==28 || index==37 || index==39 || index==40) && !confirmed) return false;
+        if ((index==28 || index==37 || index==39 || index==40 ||
+             index==41 || index==44 || (index>=47 && index<=50)) && !confirmed) return false;
         if (index==28 && !confirm_display) return false;
-        json operation={{"id",ids[index]},{"targets",entries},
+        json operation={{"id",tweak_id(index)},{"targets",entries},
                         {"ready_to_commit",false}};
         if (!write(_operation_path,operation)) return false;
         for (const auto& item:entries) {
@@ -667,7 +1045,7 @@ bool SavedTweaks::reapply(size_t index, const std::string& game_path,
         operation["ready_to_commit"]=true;
         if (!write(_operation_path,operation)) { _blocked=true; return false; }
         json updated=_saved;
-        updated[ids[index]]={{"targets",entries}};
+        updated[tweak_id(index)]={{"targets",entries}};
         if (!write(_saved_path,updated)) { _blocked=true; return false; }
         _saved=updated;
         if (!DeleteFileA(_operation_path.c_str())) { _blocked=true; return false; }
@@ -676,13 +1054,13 @@ bool SavedTweaks::reapply(size_t index, const std::string& game_path,
     } catch (...) { return false; }
 }
 bool SavedTweaks::remove(size_t index) {
-    if (_blocked || index>=41 || !_saved.contains(ids[index])) return false;
+    if (_blocked || index>=TWEAK_COUNT || !_saved.contains(tweak_id(index))) return false;
     json excluded=_dismissed;
-    excluded[ids[index]]=true;
+    excluded[tweak_id(index)]=true;
     if (!write(_dismissed_path,excluded)) return false;
     _dismissed=std::move(excluded);
     json updated=_saved;
-    updated.erase(ids[index]);
+    updated.erase(tweak_id(index));
     if (!write(_saved_path,updated)) return false;
     _saved=updated;
     _info[index].saved=false;
