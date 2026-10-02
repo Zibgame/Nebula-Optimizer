@@ -23,8 +23,8 @@ inline ViewState view_state(const Optimizer::TweakSetting& setting)
     case Optimizer::TweakStatus::Applied:
     case Optimizer::TweakStatus::Configured:
     case Optimizer::TweakStatus::AlreadyConfigured:
-        return ViewState::Applied;
     case Optimizer::TweakStatus::RestartRequired:
+        return ViewState::Applied;
     case Optimizer::TweakStatus::Skipped:
     case Optimizer::TweakStatus::Unsupported:
     case Optimizer::TweakStatus::Off:

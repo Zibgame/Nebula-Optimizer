@@ -34,7 +34,10 @@ OBJ = $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(SRC))
 
 all: $(NAME)
 
-$(NAME): $(OBJ) $(RC_OBJ) Makefile
+stop-nebula:
+	@powershell.exe -NoProfile -Command "\$$items=Get-CimInstance Win32_Process -Filter \"Name='$(NAME)'\" -ErrorAction SilentlyContinue; \$$items | Where-Object { \$$_.CommandLine -notmatch '--watchdog' } | ForEach-Object { Stop-Process -Id \$$_.ProcessId -Force -ErrorAction SilentlyContinue }; \$$limit=(Get-Date).AddSeconds(15); while ((Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension('$(NAME)')) -ErrorAction SilentlyContinue) -and (Get-Date) -lt \$$limit) { Start-Sleep -Milliseconds 100 }"
+
+$(NAME): stop-nebula $(OBJ) $(RC_OBJ) Makefile
 	$(CXX) $(CXXFLAGS) $(OBJ) $(RC_OBJ) $(LDFLAGS) -o $(NAME)
 
 $(RC_OBJ): $(RC_FILE) $(ICON) $(MANIFEST)
@@ -92,4 +95,4 @@ test-power-qos:
 	obj/test_power_qos.exe
 	@for i in 1 2 3 4 5; do rm -f obj/test_power_qos.exe && break; sleep 1; done
 
-.PHONY: all clean fclean re test-preferences test-navigation test-saved-scan test-tui-view test-background-apps test-presentmon test-power-qos
+.PHONY: all stop-nebula clean fclean re test-preferences test-navigation test-saved-scan test-tui-view test-background-apps test-presentmon test-power-qos

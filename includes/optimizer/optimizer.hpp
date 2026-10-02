@@ -237,7 +237,7 @@ private:
     bool _network_restart_needed = false;
     bool _timer_resolution_active = false;
     bool _watchdog_started = false;
-    DWORD _filter_repeat_ms = 20;
+    DWORD _filter_repeat_ms = 10;
     DWORD _mmcss_reserve_percent = 10;
     DWORD _cpu_epp_percent = 0;
     DWORD _core_parking_percent = 100;

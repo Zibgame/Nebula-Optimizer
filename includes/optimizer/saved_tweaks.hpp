@@ -62,7 +62,7 @@ private:
     std::array<Info, TWEAK_COUNT> _info{};
     bool _blocked = false;
     std::string _error;
-    std::uint32_t _filter_repeat_ms = 20;
+    std::uint32_t _filter_repeat_ms = 10;
     std::uint32_t _mmcss_reserve = 10;
     std::uint32_t _cpu_epp = 0;
     std::uint32_t _core_parking = 100;

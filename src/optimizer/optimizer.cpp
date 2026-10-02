@@ -645,7 +645,7 @@ void Optimizer::load_preferences()
         nlohmann::json settings;
         file >> settings;
         const unsigned version = settings.value("_catalog_version", 1u);
-        const DWORD repeat = settings.value("_filter_repeat_ms", DWORD(20));
+        const DWORD repeat = settings.value("_filter_repeat_ms", DWORD(10));
         if (repeat >= 10 && repeat <= 50 && repeat % 5 == 0)
             _filter_repeat_ms = repeat;
         const auto percent=[](DWORD value,DWORD fallback) {
@@ -655,6 +655,13 @@ void Optimizer::load_preferences()
         _cpu_epp_percent=percent(settings.value("_cpu_epp_percent",DWORD(0)),0);
         _core_parking_percent=percent(settings.value("_core_parking_percent",DWORD(100)),100);
         _cpu_minimum_percent=percent(settings.value("_cpu_minimum_percent",DWORD(100)),100);
+        if (version < 3) {
+            _filter_repeat_ms = 10;
+            _mmcss_reserve_percent = 10;
+            _cpu_epp_percent = 0;
+            _core_parking_percent = 100;
+            _cpu_minimum_percent = 100;
+        }
         for (size_t index = 0; index < _tweaks_enabled.size(); ++index)
             if (settings.contains(TWEAK_CATALOG[index].id) &&
                 settings[TWEAK_CATALOG[index].id].is_boolean())
@@ -662,7 +669,7 @@ void Optimizer::load_preferences()
         if (version < 2)
             for (size_t index = 6; index <= 10; ++index)
                 _tweaks_enabled[index] = false;
-        if (version < 2) save_preferences();
+        if (version < 3) save_preferences();
     } catch (...) {}
 }
 
@@ -672,7 +679,7 @@ bool Optimizer::save_preferences() const
         return false;
     try {
         nlohmann::json settings;
-        settings["_catalog_version"] = 2;
+        settings["_catalog_version"] = 3;
         settings["_filter_repeat_ms"] = _filter_repeat_ms;
         settings["_mmcss_reserve_percent"] = _mmcss_reserve_percent;
         settings["_cpu_epp_percent"] = _cpu_epp_percent;
@@ -718,10 +725,30 @@ bool Optimizer::enable_all_tweaks()
 {
     const std::lock_guard<std::recursive_mutex> lock(_state_mutex);
     const auto previous = _tweaks_enabled;
+    const DWORD previous_repeat = _filter_repeat_ms;
+    const DWORD previous_mmcss = _mmcss_reserve_percent;
+    const DWORD previous_epp = _cpu_epp_percent;
+    const DWORD previous_parking = _core_parking_percent;
+    const DWORD previous_minimum = _cpu_minimum_percent;
     _tweaks_enabled.fill(true);
+    _filter_repeat_ms = 10;
+    _mmcss_reserve_percent = 10;
+    _cpu_epp_percent = 0;
+    _core_parking_percent = 100;
+    _cpu_minimum_percent = 100;
     if (!save_preferences()) {
         _tweaks_enabled = previous;
+        _filter_repeat_ms = previous_repeat;
+        _mmcss_reserve_percent = previous_mmcss;
+        _cpu_epp_percent = previous_epp;
+        _core_parking_percent = previous_parking;
+        _cpu_minimum_percent = previous_minimum;
         return false;
+    }
+    if (_saved_tweaks) {
+        _saved_tweaks->set_filter_repeat_ms(_filter_repeat_ms);
+        _saved_tweaks->set_tunable_values(_mmcss_reserve_percent,
+            _cpu_epp_percent,_core_parking_percent,_cpu_minimum_percent);
     }
     for (size_t index=0;index<_tweak_status.size();++index)
         if (previous[index] != _tweaks_enabled[index])

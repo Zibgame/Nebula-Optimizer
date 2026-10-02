@@ -13,17 +13,19 @@ int main()
         item(Status::Applied),item(Status::AlreadyConfigured),
         item(Status::Skipped),item(Status::Unsupported),
         item(Status::Failed),item(Status::AccessDenied),
-        item(Status::RestoreIncomplete),item(Status::On),item(Status::Off)
+        item(Status::RestoreIncomplete),item(Status::On),item(Status::Off),
+        item(Status::RestartRequired)
     };
     settings[8].enabled=false;
     const ViewCounts first=view_counts(settings);
-    bool okay=first.applied==2 && first.not_applied==4 && first.failed==3 &&
+    bool okay=first.applied==3 && first.not_applied==4 && first.failed==3 &&
+        view_state(settings[9])==ViewState::Applied &&
         view_state(settings[1])==ViewState::Applied &&
         view_state(settings[7])==ViewState::NotApplied &&
         view_state(settings[8])==ViewState::NotApplied;
     settings[0].durable.drift=true;
     const ViewCounts second=view_counts(settings);
-    okay=second.applied==1 && second.not_applied==5 && second.failed==3 &&
+    okay=second.applied==2 && second.not_applied==5 && second.failed==3 &&
          view_state(settings[0])==ViewState::NotApplied && okay;
     for (int columns:{32,40,60,80,120}) {
         const int width=left_card_width(columns);

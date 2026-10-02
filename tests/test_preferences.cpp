@@ -38,10 +38,15 @@ int main()
                settings[36].category == "Memory";
         okay = optimizer.toggle_tweak(0) && okay;
         okay = optimizer.toggle_tweak(36) && okay;
-        okay = optimizer.adjust_tweak_value(41, 1) && okay;
-        okay = optimizer.adjust_tweak_value(44, -1) && okay;
         okay = !optimizer.adjust_tweak_value(0, 1) && okay;
         okay = optimizer.enable_all_tweaks() && okay;
+        const auto aggressive = optimizer.tweak_settings();
+        okay = aggressive[41].value == "10 ms" &&
+               aggressive[23].value == "0%" &&
+               aggressive[37].value == "100%" &&
+               aggressive[44].value == "100%" && okay;
+        okay = optimizer.adjust_tweak_value(41, 1) && okay;
+        okay = optimizer.adjust_tweak_value(44, -1) && okay;
     }
     {
         Optimizer optimizer;
@@ -49,7 +54,7 @@ int main()
         bool all_enabled = true;
         for (const auto& setting : settings)
             all_enabled = all_enabled && setting.enabled;
-        okay = all_enabled && settings[41].value == "25 ms" &&
+        okay = all_enabled && settings[41].value == "15 ms" &&
                settings[44].value == "95%" && okay;
     }
     std::filesystem::remove_all(std::filesystem::path(unique));

@@ -145,6 +145,37 @@ bool confirm_display_mode()
 std::ostream* frame_output = &std::cout;
 size_t frame_line = 0;
 
+class BusyIndicator {
+public:
+    BusyIndicator(HANDLE output, SHORT x, SHORT y, std::string label)
+        : _output(output), _position{x,y}, _label(std::move(label)),
+          _thread([this] { run(); }) {}
+    ~BusyIndicator() {
+        _stop.store(true);
+        if (_thread.joinable()) _thread.join();
+    }
+    BusyIndicator(const BusyIndicator&) = delete;
+    BusyIndicator& operator=(const BusyIndicator&) = delete;
+private:
+    void run() {
+        constexpr char frames[] = {'|','/','-','\\'};
+        size_t frame = 0;
+        while (!_stop.load()) {
+            const std::string text = _label + " " + frames[frame++ % 4] + "   ";
+            DWORD written = 0;
+            WriteConsoleOutputCharacterA(_output, text.c_str(),
+                                         static_cast<DWORD>(text.size()),
+                                         _position, &written);
+            Sleep(80);
+        }
+    }
+    HANDLE _output;
+    COORD _position;
+    std::string _label;
+    std::atomic<bool> _stop{false};
+    std::thread _thread;
+};
+
 const char* view_label(ViewState state)
 {
     switch (state) {
@@ -1351,26 +1382,40 @@ void Tui::optimization_monitor_screen()
     SHORT carousel_y = 0;
     CarouselLayout carousel;
     std::string tweak_message;
-    bool value_reapply_pending = false;
-    ULONGLONG value_reapply_at = 0;
     ULONGLONG previous_idle = 0;
     ULONGLONG previous_total = 0;
     ULONGLONG previous_self = 0;
     double cpu_percent = 0.0;
     double nebula_percent = 0.0;
+    std::vector<Optimizer::TweakSetting> cached_settings;
+    bool cached_has_game = false;
+    bool cached_waiting = false;
+    bool cached_game_running = false;
+    DWORD cached_game_pid = 0;
+    std::string cached_game_status;
     std::vector<std::string> previous_frame;
+    const auto refresh_optimizer_cache = [&]() {
+        cached_has_game = _optimizer.has_game_process();
+        cached_waiting = _optimizer.is_waiting_for_game();
+        cached_game_running = _optimizer.is_game_running();
+        cached_game_pid = _optimizer.game_pid();
+        cached_game_status = _optimizer.game_status();
+        cached_settings = _optimizer.tweak_settings();
+    };
+    const auto apply_live_changes = [&](SHORT y) {
+        BusyIndicator busy(console, static_cast<SHORT>(box_margin + 2), y,
+                           "Applying");
+        _optimizer.restore();
+        const bool success = _optimizer.restoration_succeeded() &&
+                             _optimizer.optimize(_launch_path, false);
+        tweak_message = success ? "Changes applied" :
+                                  "Could not apply changes";
+        previous_frame.clear();
+        return success;
+    };
+    refresh_optimizer_cache();
     while (active) {
-        if (value_reapply_pending && GetTickCount64() >= value_reapply_at) {
-            value_reapply_pending = false;
-            _optimizer.restore();
-            if (!_optimizer.restoration_succeeded() ||
-                !_optimizer.optimize(_launch_path, false)) {
-                tweak_message = "Could not apply the new value";
-                active = false;
-            } else {
-                tweak_message = "Value applied";
-            }
-        }
+        refresh_optimizer_cache();
         if (tray.stop_requested())
             break;
         if (tray.show_requested() && console_window) {
@@ -1394,8 +1439,7 @@ void Tui::optimization_monitor_screen()
         update_layout();
         if (expanded)
             scroll = scroll_to_cursor(scroll, selected_tweak, visible_rows);
-        if ((_optimizer.has_game_process() || _optimizer.is_waiting_for_game()) &&
-            !_optimizer.is_game_running()) {
+        if ((cached_has_game || cached_waiting) && !cached_game_running) {
             game_ended = true;
             break;
         }
@@ -1501,20 +1545,20 @@ void Tui::optimization_monitor_screen()
         own << "Nebula: " << std::fixed << std::setprecision(2)
             << nebula_percent << "% CPU  /  "
             << (own_memory.WorkingSetSize / (1024 * 1024)) << " MB";
-        const std::vector<Optimizer::TweakSetting> settings = _optimizer.tweak_settings();
+        const std::vector<Optimizer::TweakSetting>& settings = cached_settings;
         const ImpactEstimate impact = estimate_impact(settings, _closed_apps_summary);
 
         std::ostringstream frame;
         frame_output = &frame;
         frame_line = 0;
         title("Active session");
-        row(_optimizer.game_status(),LIGHT_GREEN);
+        row(cached_game_status,LIGHT_GREEN);
         row("Time: " + uptime.str(),BRIGHT_BLACK);
         divider();
         row(ram.str(), LIGHT_CYAN);
         row(cpu.str(),LIGHT_CYAN);
         row(own.str(),BRIGHT_BLACK);
-        row(_optimizer.game_pid() ? latency.status() + "  [P] Capture 10 s" :
+        row(cached_game_pid ? latency.status() + "  [P] Capture 10 s" :
             "Input-to-display: no game attached", BRIGHT_BLACK);
         if (!benchmark_status.empty()) row(benchmark_status, LIGHT_PURPLE);
         if (box_width < 52)
@@ -1577,10 +1621,18 @@ void Tui::optimization_monitor_screen()
                                   ")  [Enter]", selected ? LIGHT_PURPLE : LIGHT_CYAN}});
                 else tweak_row(settings[category_tweaks[position]],selected);
             }
-            const std::string marker=category_tweaks.empty() ||
-                category_tweaks[selected_tweak] == CLOSE_APPS_ROW ? "" :
-                settings[category_tweaks[selected_tweak]].durable.base ?
-                "   BASE" : "";
+            std::string marker;
+            if (!category_tweaks.empty() &&
+                category_tweaks[selected_tweak] != CLOSE_APPS_ROW) {
+                const auto& selected = settings[category_tweaks[selected_tweak]];
+                if (selected.durable.base) marker = "   BASE";
+                else if (selected.status == Optimizer::TweakStatus::Skipped)
+                    marker = "   NO TARGET";
+                else if (selected.status == Optimizer::TweakStatus::Unsupported)
+                    marker = "   UNSUPPORTED";
+                else if (selected.status == Optimizer::TweakStatus::RestartRequired)
+                    marker = "   RESTART";
+            }
             colored_row({{TWEAK_CATEGORIES[selected_category],LIGHT_PURPLE},
                          {"   " + std::to_string(category_tweaks.empty() ? 0 : scroll+1) +
                           "-" + std::to_string((std::min)(scroll+visible_rows,
@@ -1607,7 +1659,7 @@ void Tui::optimization_monitor_screen()
             if (selected.durable.saved && selected.durable.drift)
                 actions.push_back(SessionAction::Reapply);
         }
-        if (_optimizer.game_pid()) {
+        if (cached_game_pid) {
             actions.push_back(SessionAction::Capture);
             actions.push_back(SessionAction::Benchmark);
         }
@@ -1720,6 +1772,10 @@ void Tui::optimization_monitor_screen()
                 if (key == '0')
                     active = false;
                 else if (key == 'a' || key == 'A') {
+                    if (benchmark_stage != BenchmarkStage::Idle) {
+                        tweak_message = "Wait for the current operation";
+                        break;
+                    }
                     SetConsoleCursorInfo(console, &original_cursor);
                     const bool confirmed = select_menu(
                         "Apply all compatible tweaks?",
@@ -1730,18 +1786,13 @@ void Tui::optimization_monitor_screen()
                         tweak_message = "Cancelled";
                     } else if (!_optimizer.enable_all_tweaks()) {
                         tweak_message = "Could not save tweak settings";
-                    } else if (_optimizer.is_waiting_for_game()) {
+                    } else if (cached_waiting) {
                         tweak_message = "All tweaks enabled for the next session";
                     } else {
-                        value_reapply_pending = false;
-                        _optimizer.restore();
-                        if (!_optimizer.restoration_succeeded() ||
-                            !_optimizer.optimize(_launch_path, false)) {
-                            tweak_message = "Could not reapply session";
-                            active = false;
-                        } else {
-                            tweak_message = "All compatible tweaks applied";
-                        }
+                        cached_settings = _optimizer.tweak_settings();
+                        const SHORT busy_y = screen_info.srWindow.Top +
+                            static_cast<SHORT>(frame_line > 2 ? frame_line - 2 : 1);
+                        if (!apply_live_changes(busy_y)) active = false;
                     }
                     break;
                 }
@@ -1779,14 +1830,17 @@ void Tui::optimization_monitor_screen()
                     }
                     if (value_direction) {
                         const size_t index = category_tweaks[selected_tweak];
-                        if (!_optimizer.adjust_tweak_value(index, value_direction)) {
+                        if (benchmark_stage != BenchmarkStage::Idle) {
+                            tweak_message = "Wait for the current operation";
+                        } else if (!_optimizer.adjust_tweak_value(index, value_direction)) {
                             tweak_message = "Could not save value";
-                        } else if (_optimizer.is_waiting_for_game()) {
+                        } else if (cached_waiting) {
                             tweak_message = "Value saved for the next session";
                         } else {
-                            value_reapply_pending = true;
-                            value_reapply_at = GetTickCount64() + 350;
-                            tweak_message = "Value updated";
+                            cached_settings = _optimizer.tweak_settings();
+                            const SHORT busy_y = screen_info.srWindow.Top +
+                                static_cast<SHORT>(frame_line > 2 ? frame_line - 2 : 1);
+                            if (!apply_live_changes(busy_y)) active = false;
                         }
                     } else if (category_direction) {
                         selected_category = move_carousel(
@@ -1816,9 +1870,8 @@ void Tui::optimization_monitor_screen()
                                 ~ENABLE_QUICK_EDIT_MODE);
                         SetConsoleCursorInfo(console, &hidden_cursor);
                         if (added &&
-                            ((!_optimizer.has_game_process() &&
-                              !_optimizer.is_waiting_for_game()) ||
-                             _optimizer.is_game_running())) {
+                            ((!cached_has_game && !cached_waiting) ||
+                             cached_game_running)) {
                             const auto result = _background_apps.close_selected(_launch_path);
                             _closed_apps_summary.closed += result.closed;
                             _closed_apps_summary.skipped += result.skipped;
@@ -1827,20 +1880,18 @@ void Tui::optimization_monitor_screen()
                                 result.available_ram_delta_bytes;
                         }
                         previous_frame.clear();
+                    } else if (benchmark_stage != BenchmarkStage::Idle) {
+                        tweak_message = "Wait for the current operation";
                     } else if (category_tweaks.empty() ||
                         !_optimizer.toggle_tweak(category_tweaks[selected_tweak])) {
                         tweak_message = "Could not save tweak settings";
-                    } else if (_optimizer.is_waiting_for_game()) {
+                    } else if (cached_waiting) {
                         tweak_message = "Saved for the next session";
                     } else {
-                        _optimizer.restore();
-                        if (!_optimizer.restoration_succeeded() ||
-                            !_optimizer.optimize(_launch_path, false)) {
-                            tweak_message = "Could not reapply session";
-                            active = false;
-                        } else {
-                            tweak_message = "Tweak updated";
-                        }
+                        cached_settings = _optimizer.tweak_settings();
+                        const SHORT busy_y = screen_info.srWindow.Top +
+                            static_cast<SHORT>(frame_line > 2 ? frame_line - 2 : 1);
+                        if (!apply_live_changes(busy_y)) active = false;
                     }
                     break;
                 } else if (expanded && (key == 's' || key == 'S' ||
@@ -1893,17 +1944,17 @@ void Tui::optimization_monitor_screen()
                         ("Save failed: " + _optimizer.saved_error());
                     break;
                 } else if (key == 'p' || key == 'P') {
-                    latency.start(_optimizer.game_pid());
+                    latency.start(cached_game_pid);
                     break;
                 } else if ((key == 'b' || key == 'B') &&
                            benchmark_stage == BenchmarkStage::Idle) {
-                    if (_launch_path.empty() || !_optimizer.game_pid()) {
+                    if (_launch_path.empty() || !cached_game_pid) {
                         benchmark_status = "A/B needs an active game profile";
                         break;
                     }
                     PresentMonMetrics stale{};
                     latency.take_result(stale);
-                    benchmark_pid = _optimizer.game_pid();
+                    benchmark_pid = cached_game_pid;
                     benchmark_run = 0;
                     benchmark_before.clear(); benchmark_after.clear();
                     _optimizer.restore();
