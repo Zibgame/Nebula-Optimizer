@@ -220,6 +220,7 @@ private:
     std::vector<BackgroundState> _background_state;
     std::vector<PowerSettingState> _power_settings;
     DisplayState _display_state{};
+    bool _display_refresh_checked = false;
     AccessibilityState _accessibility_state{};
     InputTuningState _input_tuning_state{};
     std::vector<AdvancedProcessState> _advanced_processes;

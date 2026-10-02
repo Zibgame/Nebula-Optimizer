@@ -2899,7 +2899,7 @@ void Optimizer::optimize_display_refresh(DWORD game_pid)
     if (game_pid) {
         GameWindowSearch search{game_pid, nullptr, 0};
         EnumWindows(find_game_window, reinterpret_cast<LPARAM>(&search));
-        if (!search.window) { set_status(28, TweakStatus::Skipped); return; }
+        if (!search.window) { return; }
         MONITORINFOEXA monitor{};
         monitor.cbSize = sizeof(monitor);
         if (GetMonitorInfoA(MonitorFromWindow(search.window, MONITOR_DEFAULTTONEAREST),
@@ -2915,9 +2915,11 @@ void Optimizer::optimize_display_refresh(DWORD game_pid)
         device.cb = sizeof(device);
     }
     if (!found) {
+        _display_refresh_checked = true;
         set_status(28, TweakStatus::Failed);
         return;
     }
+    _display_refresh_checked = true;
     DEVMODEA current{};
     current.dmSize = sizeof(current);
     if (!EnumDisplaySettingsA(device.DeviceName, ENUM_CURRENT_SETTINGS, &current)) {
@@ -3057,6 +3059,7 @@ bool Optimizer::optimize(const std::string& game_path, bool launch_if_missing)
     _last_helper_scan = GetTickCount64();
     _restoration_status.clear();
     _restoration_succeeded = false;
+    _display_refresh_checked = false;
     save_power_plan(_saved_power_plan_guid, sizeof(_saved_power_plan_guid));
     if (!save_journal()) {
         _last_error = "Could not create recovery log";
@@ -3279,7 +3282,7 @@ bool Optimizer::find_target_process()
     _game_process = candidate;
     _game_pid = pid;
     _waiting_for_game = false;
-    if (enabled(28) && _display_state.device.empty())
+    if (enabled(28) && !_display_refresh_checked)
         optimize_display_refresh(pid);
 
     HANDLE tune = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
@@ -3305,12 +3308,12 @@ bool Optimizer::is_game_running()
     DWORD exit_code = 0;
     const bool running = GetExitCodeProcess(_game_process, &exit_code) &&
                          exit_code == STILL_ACTIVE;
-    if (running && GetTickCount64() - _last_helper_scan >= 15000) {
+    if (running && GetTickCount64() - _last_helper_scan >= 30000) {
         _last_helper_scan = GetTickCount64();
         throttle_background_processes();
         tune_background_io();
     }
-    if (running && enabled(28) && _display_state.device.empty())
+    if (running && enabled(28) && !_display_refresh_checked)
         optimize_display_refresh(_game_pid);
     return running;
 }

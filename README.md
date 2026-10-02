@@ -65,16 +65,20 @@ fast repeat and keyboard repeat controls. Mouse acceleration, sensitivity,
 speed and pointer curves are never modified. The new input
 controls and aggressive power controls default off. Power settings
 are applied to a temporary copy of the active plan, which is deleted after the
-session. The session view distinguishes `Applied` (an effect verified through
-an API), `Set` (a value written and read back without proof of runtime effect),
-`Next run`, `Skipped`, and `Failed`. None implies a measured performance gain.
-`Off` and `Drift` remain separate and are
+session. The session view deliberately keeps only three results: `Applied`
+(already present or successfully configured), `Not applied`, and `Failed`.
+None implies a measured performance gain. Saved and drift information remains
+available through the Saved tab and is
 not counted. The left-aligned layout is preserved, while live metrics update
 without clearing the whole frame each time. Every changed value is journaled
 for restoration. A hidden watchdog from the same single EXE verifies the parent
 PID and creation time and restores the journal immediately after a crash. On
 startup, Nebula retires older interactive instances from its own directory,
 preserves the watchdog, waits for recovery, then starts.
+During an active session the monitor thread runs below normal priority, hidden
+UI updates sleep, helper discovery is rate-limited, and display discovery stops
+after a valid monitor was checked. PresentMon is never started automatically:
+only `Capture` or `A/B test` runs it.
 If recovery is incomplete, close the game and press `R` to retry.
 
 The attached optimization plan is only partially implemented. See

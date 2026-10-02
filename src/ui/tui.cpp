@@ -15,7 +15,6 @@
 #include <deque>
 #include <cmath>
 #include <cwchar>
-#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <psapi.h>
@@ -149,28 +148,18 @@ const char* view_label(ViewState state)
 {
     switch (state) {
     case ViewState::Applied: return "Applied";
-    case ViewState::Configured: return "Set";
-    case ViewState::Restart: return "Next run";
-    case ViewState::Skipped: return "Skipped";
+    case ViewState::NotApplied: return "Not applied";
     case ViewState::Failed: return "Failed";
-    case ViewState::Off: return "Off";
-    case ViewState::Drift: return "Drift";
-    case ViewState::Pending: return "On";
     }
-    return "On";
+    return "Not applied";
 }
 
 const char* view_color(ViewState state)
 {
     switch (state) {
     case ViewState::Applied: return LIGHT_GREEN;
-    case ViewState::Configured: return LIGHT_CYAN;
-    case ViewState::Restart: return LIGHT_YELLOW;
-    case ViewState::Skipped: return LIGHT_YELLOW;
+    case ViewState::NotApplied: return LIGHT_YELLOW;
     case ViewState::Failed: return LIGHT_RED;
-    case ViewState::Drift: return LIGHT_RED;
-    case ViewState::Off: return BRIGHT_BLACK;
-    case ViewState::Pending: return LIGHT_CYAN;
     }
     return WHITE;
 }
@@ -487,55 +476,6 @@ ULONGLONG ticks(const FILETIME& time)
     return (static_cast<ULONGLONG>(time.dwHighDateTime) << 32) |
            time.dwLowDateTime;
 }
-
-class CoreCpuMonitor {
-public:
-    double sample()
-    {
-        struct Entry {
-            LARGE_INTEGER idle, kernel, user, dpc, interrupt;
-            ULONG interrupt_count;
-        };
-        if (!_query) {
-            const FARPROC address = GetProcAddress(GetModuleHandleA("ntdll.dll"),
-                                                   "NtQuerySystemInformation");
-            static_assert(sizeof(_query) == sizeof(address), "function pointer size");
-            std::memcpy(&_query, &address, sizeof(_query));
-        }
-        if (!_query) return 0.0;
-        SYSTEM_INFO info{}; GetNativeSystemInfo(&info);
-        std::vector<Entry> values(info.dwNumberOfProcessors);
-        unsigned long returned = 0;
-        if (_query(8, values.data(), static_cast<unsigned long>(values.size() * sizeof(Entry)),
-                   &returned) < 0)
-            return 0.0;
-        const size_t count = returned / sizeof(Entry);
-        if (_idle.size() != count) {
-            _idle.resize(count); _total.resize(count);
-            for (size_t i = 0; i < count; ++i) {
-                _idle[i] = values[i].idle.QuadPart;
-                _total[i] = values[i].kernel.QuadPart + values[i].user.QuadPart;
-            }
-            return 0.0;
-        }
-        double peak = 0.0;
-        for (size_t i = 0; i < count; ++i) {
-            const ULONGLONG idle = values[i].idle.QuadPart;
-            const ULONGLONG total = values[i].kernel.QuadPart + values[i].user.QuadPart;
-            if (total > _total[i]) {
-                const double busy = 100.0 * (1.0 - static_cast<double>(idle - _idle[i]) /
-                                              static_cast<double>(total - _total[i]));
-                peak = (std::max)(peak, (std::max)(0.0, (std::min)(100.0, busy)));
-            }
-            _idle[i] = idle; _total[i] = total;
-        }
-        return peak;
-    }
-private:
-    using Query = LONG (WINAPI*)(int, void*, unsigned long, unsigned long*);
-    Query _query = nullptr;
-    std::vector<ULONGLONG> _idle, _total;
-};
 
 class LatencyCapture {
 public:
@@ -1346,6 +1286,8 @@ void Tui::launch_current_mode()
 
 void Tui::optimization_monitor_screen()
 {
+    const int original_thread_priority = GetThreadPriority(GetCurrentThread());
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
     CONSOLE_CURSOR_INFO original_cursor{};
     GetConsoleCursorInfo(console, &original_cursor);
@@ -1361,8 +1303,6 @@ void Tui::optimization_monitor_screen()
     HWND console_window = GetConsoleWindow();
     TrayIcon& tray = *_tray;
     LatencyCapture latency;
-    CoreCpuMonitor core_cpu;
-    double peak_core_percent = 0.0;
     enum class BenchmarkStage { Idle, BaselineWarmup, BaselineCapture,
                                 OptimizedWarmup, OptimizedCapture };
     BenchmarkStage benchmark_stage = BenchmarkStage::Idle;
@@ -1501,7 +1441,6 @@ void Tui::optimization_monitor_screen()
             previous_total = total_now;
             previous_self = self_now;
         }
-        peak_core_percent = core_cpu.sample();
 
         PROCESS_MEMORY_COUNTERS_EX own_memory{};
         own_memory.cb = sizeof(own_memory);
@@ -1518,8 +1457,7 @@ void Tui::optimization_monitor_screen()
             << std::fixed << std::setprecision(1) << used_ratio * 100.0 << "%";
         std::ostringstream cpu;
         cpu << "CPU: " << std::fixed << std::setprecision(1)
-            << (std::max)(0.0, (std::min)(100.0, cpu_percent)) << "%  |  peak core "
-            << peak_core_percent << "%";
+            << (std::max)(0.0, (std::min)(100.0, cpu_percent)) << "%";
         std::ostringstream own;
         own << "Nebula: " << std::fixed << std::setprecision(2)
             << nebula_percent << "% CPU  /  "
@@ -1563,16 +1501,8 @@ void Tui::optimization_monitor_screen()
                 " MB", apps.closed ? LIGHT_GREEN : BRIGHT_BLACK);
         divider();
         const ViewCounts counts=view_counts(settings);
-        if (box_width < 52) {
-            colored_row({{"Applied " + std::to_string(counts.applied),LIGHT_GREEN},
-                         {"  Set " + std::to_string(counts.configured),LIGHT_CYAN},
-                         {"  Next " + std::to_string(counts.restart),LIGHT_PURPLE}});
-            colored_row({{"Skipped " + std::to_string(counts.skipped),LIGHT_YELLOW},
-                         {"  Failed " + std::to_string(counts.failed),LIGHT_RED}});
-        } else colored_row({{"Applied " + std::to_string(counts.applied),LIGHT_GREEN},
-                     {"  |  Set " + std::to_string(counts.configured),LIGHT_CYAN},
-                     {"  |  Next run " + std::to_string(counts.restart),LIGHT_PURPLE},
-                     {"  |  Skipped " + std::to_string(counts.skipped),LIGHT_YELLOW},
+        colored_row({{"Applied " + std::to_string(counts.applied),LIGHT_GREEN},
+                     {"  |  Not applied " + std::to_string(counts.not_applied),LIGHT_YELLOW},
                      {"  |  Failed " + std::to_string(counts.failed),LIGHT_RED}});
         std::vector<size_t> category_tweaks;
         if (selected_category == std::size(TWEAK_CATEGORIES)-1) {
@@ -1909,6 +1839,8 @@ void Tui::optimization_monitor_screen()
     if (mouse_enabled)
         SetConsoleMode(input, original_input_mode);
     SetConsoleCursorInfo(console, &original_cursor);
+    if (original_thread_priority != THREAD_PRIORITY_ERROR_RETURN)
+        SetThreadPriority(GetCurrentThread(), original_thread_priority);
     _current_screen = STARTUP;
 }
 

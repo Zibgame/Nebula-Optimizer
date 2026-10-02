@@ -17,16 +17,14 @@ int main()
     };
     settings[8].enabled=false;
     const ViewCounts first=view_counts(settings);
-    bool okay=first.applied==1 && first.configured==1 && first.restart==0 &&
-        first.skipped==2 && first.failed==3 &&
-        view_state(settings[1])==ViewState::Configured &&
-        view_state(settings[7])==ViewState::Pending &&
-        view_state(settings[8])==ViewState::Off;
+    bool okay=first.applied==2 && first.not_applied==4 && first.failed==3 &&
+        view_state(settings[1])==ViewState::Applied &&
+        view_state(settings[7])==ViewState::NotApplied &&
+        view_state(settings[8])==ViewState::NotApplied;
     settings[0].durable.drift=true;
     const ViewCounts second=view_counts(settings);
-    okay=second.applied==0 && second.configured==1 && second.skipped==2 &&
-         second.failed==3 &&
-         view_state(settings[0])==ViewState::Drift && okay;
+    okay=second.applied==1 && second.not_applied==5 && second.failed==3 &&
+         view_state(settings[0])==ViewState::NotApplied && okay;
     for (int columns:{32,40,60,80,120}) {
         const int width=left_card_width(columns);
         okay=width<=68 && width+4<=columns && okay;
