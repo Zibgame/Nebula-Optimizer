@@ -779,19 +779,23 @@ bool SavedTweaks::scan(const std::string& game_path) {
         observed_known[i]=known;
         if (!_scan.contains(tweak_id(i)))
             _scan[tweak_id(i)]["first"]=known ? values : json(nullptr);
+        // An explicit scan defines the reference to restore.  Unknown targets
+        // are stored as null and are never guessed during restoration.
+        _scan[tweak_id(i)]["baseline"]=known ? values : json(nullptr);
+        _scan[tweak_id(i)]["baseline_targets"]=known ? target : json(nullptr);
         if (known && (!_scan[tweak_id(i)].contains("first_known") ||
                       _scan[tweak_id(i)]["first_known"].is_null()))
             _scan[tweak_id(i)]["first_known"]=values;
         _scan[tweak_id(i)]["last"]=known ? values : json(nullptr);
         _info[i].unknown=!known;
-        const json& reference=_scan[tweak_id(i)].contains("first_known") ?
-            _scan[tweak_id(i)]["first_known"] : _scan[tweak_id(i)]["first"];
+        const json& reference=values;
         _info[i].base=known && reference.is_array() &&
                       reference.size()==target.size();
         if (_info[i].base) for (size_t n=0;n<target.size();++n)
             if (!equal_value(target[n],reference[n],target[n]["desired"]))
                 _info[i].base=false;
     }
+    _scan["_meta"]={{"complete",true},{"game_path",game_path}};
     if (!write(_scan_path,_scan)) {
         _blocked=true; _error="Could not save baseline scan"; return false;
     }
@@ -799,6 +803,54 @@ bool SavedTweaks::scan(const std::string& game_path) {
         return false;
     refresh_saved(game_path);
     return true;
+}
+
+bool SavedTweaks::has_baseline() const
+{
+    try {
+        return _scan.contains("_meta") &&
+               _scan.at("_meta").value("complete", false);
+    } catch (...) { return false; }
+}
+
+bool SavedTweaks::has_baseline_for(const std::string& game_path) const
+{
+    if (!has_baseline() || game_path.empty()) return has_baseline();
+    try {
+        const std::string scanned=_scan.at("_meta").value("game_path",std::string());
+        return !scanned.empty() && _stricmp(scanned.c_str(),game_path.c_str())==0;
+    } catch (...) { return false; }
+}
+
+bool SavedTweaks::restore_baseline(const std::string& game_path)
+{
+    if (_blocked || !has_baseline()) return !_blocked;
+    bool okay=true;
+    for (size_t i=0;i<TWEAK_COUNT;++i) {
+        if (!_info[i].eligible || _saved.contains(tweak_id(i)) ||
+            !_scan.contains(tweak_id(i))) continue;
+        const json& entry=_scan.at(tweak_id(i));
+        if (!entry.contains("baseline") || !entry.contains("baseline_targets") ||
+            !entry.at("baseline").is_array() ||
+            !entry.at("baseline_targets").is_array()) continue;
+        const json& values=entry.at("baseline");
+        const json& stored_targets=entry.at("baseline_targets");
+        if (values.size()!=stored_targets.size()) {okay=false; continue;}
+        for (size_t n=0;n<values.size();++n) {
+            json current;
+            if (!read_target(stored_targets[n],current)) {okay=false; continue;}
+            if (equal_value(stored_targets[n],current,values[n])) continue;
+            if (!write_target(stored_targets[n],values[n],nullptr)) {
+                okay=false; continue;
+            }
+            json verified;
+            if (!read_target(stored_targets[n],verified) ||
+                !equal_value(stored_targets[n],verified,values[n])) okay=false;
+        }
+    }
+    (void)game_path;
+    if (!okay) _error="Baseline restore incomplete";
+    return okay;
 }
 
 bool SavedTweaks::import_base_settings(

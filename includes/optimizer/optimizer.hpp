@@ -46,6 +46,7 @@ public:
     std::vector<TweakSetting> tweak_settings() const;
     bool toggle_tweak(size_t index);
     bool scan_saved(const std::string& game_path);
+    bool has_baseline_scan(const std::string& game_path = {}) const;
     bool save_tweak(size_t index, const std::string& game_path,
                     bool confirmed, bool (*confirm_display)() = nullptr);
     bool unsave_tweak(size_t index);
@@ -141,6 +142,7 @@ private:
         DWORD pid = 0;
         ULONGLONG created_at = 0;
         std::vector<ULONG> cpu_sets;
+        std::vector<ULONG> applied_cpu_sets;
         ULONG io_priority = 0;
         ULONG applied_io_priority = 0;
         bool cpu_sets_touched = false;
@@ -211,6 +213,7 @@ private:
     DWORD _game_pid;
     std::string _game_directory;
     std::string _target_game_path;
+    std::string _baseline_game_path;
     bool _waiting_for_game;
     ULONGLONG _launch_started;
     ULONGLONG _last_helper_scan;

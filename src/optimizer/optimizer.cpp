@@ -584,17 +584,14 @@ Optimizer::Optimizer()
         _preferences_path = std::string(local_app_data) +
                             "\\NebulaOptimizer\\tweaks.json";
         load_preferences();
-        recover_journal();
         _saved_tweaks = std::make_unique<SavedTweaks>(
             std::string(local_app_data) + "\\NebulaOptimizer");
-        if (!_recovery_failed && !_saved_tweaks->recover() ) {
+        if (!_saved_tweaks->recover()) {
             _recovery_failed = true;
             _restoration_status = _saved_tweaks->error();
         }
-        if (!_recovery_failed && !_saved_tweaks->scan("")) {
-            _recovery_failed = true;
-            _restoration_status = _saved_tweaks->error();
-        }
+        if (!_recovery_failed)
+            recover_journal();
     }
     for (size_t index = 0; index < _tweaks_enabled.size(); ++index)
         if (!_tweaks_enabled[index])
@@ -695,6 +692,12 @@ bool Optimizer::scan_saved(const std::string& game_path)
     return _saved_tweaks && !_recovery_failed && _saved_tweaks->scan(game_path);
 }
 
+bool Optimizer::has_baseline_scan(const std::string& game_path) const
+{
+    const std::lock_guard<std::recursive_mutex> lock(_state_mutex);
+    return _saved_tweaks && _saved_tweaks->has_baseline_for(game_path);
+}
+
 bool Optimizer::save_tweak(size_t index, const std::string& game_path,
                            bool confirmed, bool (*confirm_display)())
 {
@@ -776,6 +779,7 @@ bool Optimizer::save_journal() const
     try {
         nlohmann::json state;
         state["power_plan"] = _saved_power_plan_guid;
+        state["baseline_game_path"] = _baseline_game_path;
         state["session_power_plan"] = _session_power_plan_guid;
         state["registry"] = nlohmann::json::array();
         state["background"] = nlohmann::json::array();
@@ -885,7 +889,9 @@ bool Optimizer::save_journal() const
         for (const AdvancedProcessState& entry : _advanced_processes) {
             state["advanced_processes"].push_back({
                 {"pid", entry.pid}, {"created_at", entry.created_at},
-                {"cpu_sets", entry.cpu_sets}, {"io_priority", entry.io_priority},
+                {"cpu_sets", entry.cpu_sets},
+                {"applied_cpu_sets", entry.applied_cpu_sets},
+                {"io_priority", entry.io_priority},
                 {"applied_io_priority", entry.applied_io_priority},
                 {"cpu_sets_touched", entry.cpu_sets_touched},
                 {"io_touched", entry.io_touched}
@@ -927,6 +933,7 @@ void Optimizer::recover_journal()
         file >> state;
         file.close();
         const std::string power = state.value("power_plan", std::string());
+        _baseline_game_path = state.value("baseline_game_path", std::string());
         if (power.size() >= sizeof(_saved_power_plan_guid))
             throw std::runtime_error("Invalid original power scheme in recovery log");
         std::memcpy(_saved_power_plan_guid, power.c_str(), power.size() + 1);
@@ -1044,6 +1051,8 @@ void Optimizer::recover_journal()
             entry.pid = item.at("pid").get<DWORD>();
             entry.created_at = item.at("created_at").get<ULONGLONG>();
             entry.cpu_sets = item.value("cpu_sets", std::vector<ULONG>{});
+            entry.applied_cpu_sets = item.value("applied_cpu_sets",
+                                                std::vector<ULONG>{});
             entry.io_priority = item.value("io_priority", ULONG(0));
             entry.applied_io_priority = item.value("applied_io_priority", ULONG(0));
             entry.cpu_sets_touched = item.value("cpu_sets_touched", false);
@@ -1085,6 +1094,9 @@ void Optimizer::recover_journal()
             okay = restore_session_power_plan() && okay;
         else if (!power.empty())
             okay = set_power_plan(power.c_str()) && okay;
+        if (_saved_tweaks && _saved_tweaks->has_baseline())
+            okay = _saved_tweaks->restore_baseline(_baseline_game_path) && okay;
+        _baseline_game_path.clear();
         if (okay && DeleteFileA(_journal_path.c_str())) {
             _restoration_status = "Previous session restored";
             _restoration_succeeded = true;
@@ -2553,17 +2565,25 @@ void Optimizer::tune_advanced_game_process(HANDLE process, DWORD pid)
                 set_status(54, TweakStatus::Unsupported);
             } else {
                 state.cpu_sets_touched = true;
+                state.applied_cpu_sets = performance;
                 _advanced_processes.push_back(state);
                 if (!save_journal()) {
                     _advanced_processes.pop_back();
                     state.cpu_sets_touched = false;
                     set_status(54, TweakStatus::Failed);
                 } else {
-                    const bool applied = SetProcessDefaultCpuSets(
+                    const bool written = SetProcessDefaultCpuSets(
                         process, performance.data(),
                         static_cast<ULONG>(performance.size())) != FALSE;
+                    ULONG verified_count = 0;
+                    GetProcessDefaultCpuSets(process, nullptr, 0, &verified_count);
+                    std::vector<ULONG> verified(verified_count);
+                    const bool applied = written &&
+                        (!verified_count || GetProcessDefaultCpuSets(
+                            process, verified.data(), verified_count,
+                            &verified_count)) && verified == performance;
                     set_status(54, applied ? TweakStatus::Applied : TweakStatus::Failed);
-                    if (!applied) {
+                    if (!written) {
                         _advanced_processes.pop_back(); save_journal();
                         state.cpu_sets_touched = false;
                     }
@@ -2680,11 +2700,24 @@ bool Optimizer::restore_advanced_processes()
             ULONG count = 0;
             GetProcessDefaultCpuSets(process, nullptr, 0, &count);
             std::vector<ULONG> current(count);
-            if ((count && !GetProcessDefaultCpuSets(process, current.data(), count, &count)) ||
-                !SetProcessDefaultCpuSets(process,
-                    item->cpu_sets.empty() ? nullptr : item->cpu_sets.data(),
-                    static_cast<ULONG>(item->cpu_sets.size())))
+            if (count && !GetProcessDefaultCpuSets(process, current.data(), count, &count)) {
                 okay = false;
+            } else if (current != item->cpu_sets) {
+                if (current != item->applied_cpu_sets ||
+                    !SetProcessDefaultCpuSets(process,
+                        item->cpu_sets.empty() ? nullptr : item->cpu_sets.data(),
+                        static_cast<ULONG>(item->cpu_sets.size()))) {
+                    okay = false;
+                } else {
+                    ULONG verified_count = 0;
+                    GetProcessDefaultCpuSets(process, nullptr, 0, &verified_count);
+                    std::vector<ULONG> verified(verified_count);
+                    if ((verified_count && !GetProcessDefaultCpuSets(
+                            process, verified.data(), verified_count,
+                            &verified_count)) || verified != item->cpu_sets)
+                        okay = false;
+                }
+            }
         }
         CloseHandle(process);
     }
@@ -3060,6 +3093,7 @@ bool Optimizer::optimize(const std::string& game_path, bool launch_if_missing)
     _restoration_status.clear();
     _restoration_succeeded = false;
     _display_refresh_checked = false;
+    _baseline_game_path = game_path;
     save_power_plan(_saved_power_plan_guid, sizeof(_saved_power_plan_guid));
     if (!save_journal()) {
         _last_error = "Could not create recovery log";
@@ -3227,6 +3261,9 @@ void Optimizer::restore()
         SetThreadExecutionState(ES_CONTINUOUS);
         _power_request_active = false;
     }
+    if (_saved_tweaks && _saved_tweaks->has_baseline())
+        restored = _saved_tweaks->restore_baseline(_baseline_game_path) && restored;
+    _baseline_game_path.clear();
     _restoration_succeeded = restored && !_journal_path.empty() &&
                              DeleteFileA(_journal_path.c_str());
     if (_restoration_succeeded)

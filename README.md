@@ -36,25 +36,33 @@ Fortnite launches through its official Epic desktop shortcut. Nebula targets `Fo
 
 Registry values, power plan, and changed process priorities are journaled at `%LOCALAPPDATA%\NebulaOptimizer\session-journal.json`. Nebula recovers them after an unexpected exit. A successful restore triggers one notification.
 
+Before the first optimization, Nebula offers an explicit baseline scan. That
+scan becomes the restoration reference for every readable durable setting;
+unknown targets are never guessed. See [docs/RESTORATION.md](docs/RESTORATION.md)
+for the complete 60-tweak restoration map.
+
 Tweak choices are saved at `%LOCALAPPDATA%\NebulaOptimizer\tweaks.json`. During an active game, a change restores and reapplies the session; while waiting for Fortnite to start, the change takes effect next session. Optional Game Bar shortcut tweaks start off because they can interfere with recording controls.
 
 Nebula scans durable settings without changing Windows after session recovery.
-`baseline.json` keeps the first, first available, and latest raw observations;
-`Base` means the first available observation already matched Nebula's target, while `Unknown` means it
+`baseline.json` keeps historical observations plus the explicit restoration
+snapshot and exact target identities; `Base` means the scanned observation
+already matched Nebula's target, while `Unknown` means it
 could not be established. `saved.json` stores retained settings (automatic `Base`
 imports and manual choices),
 and `saved-operation.json` is a separate crash-recovery transaction. A yellow
 `*` marks `Saved`; unpinning leaves the Windows value as-is. `Drift` means a
 saved value changed outside Nebula: it is not silently reapplied, even when a
-session starts. The normal session still restores its own pre-session values,
-not the baseline scan. Process priorities, sleep prevention and the temporary
+session starts. A normal session first restores its exact pre-session state,
+then restores the explicit scan reference for durable settings that are not
+`Saved`. Dynamic process settings use their exact pre-session state because
+they do not exist reliably at scan time. Process priorities, sleep prevention and the temporary
 power-plan clone cannot be saved. Saving a power setting changes the base plan
 identified by its GUID; GPU preference is tied to the exact game executable.
 Display saving requires a 15-second visual confirmation, and experimental,
 diagnostic or accessibility settings require an additional confirmation.
-At startup, a read-only scan automatically adds already-matching durable `Base`
-settings to `Saved`; it does not apply anything to Windows. `Scan PC` on the
-home screen repeats the scan. If you unpin a setting, Nebula records that choice
+The explicit read-only scan adds already-matching durable `Base` settings to
+`Saved`; it does not apply anything to Windows. `Scan PC` on the home screen
+replaces the restoration reference with a fresh snapshot. If you unpin a setting, Nebula records that choice
 in `saved-dismissed.json` and will not import it again automatically. A later
 manual `S` can save it again.
 

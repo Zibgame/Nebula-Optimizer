@@ -20,6 +20,9 @@ public:
     explicit SavedTweaks(const std::string& directory);
     bool recover();
     bool scan(const std::string& game_path);
+    bool has_baseline() const;
+    bool has_baseline_for(const std::string& game_path) const;
+    bool restore_baseline(const std::string& game_path);
     bool apply(size_t index, const std::string& game_path,
                bool confirmed, bool (*confirm_display)() = nullptr);
     bool remove(size_t index);

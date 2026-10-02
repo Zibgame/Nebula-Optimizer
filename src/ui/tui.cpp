@@ -1054,6 +1054,16 @@ void Tui::startup_screen()
                         _current_screen = CREATE_PROFILE;
                         return;
                     } else {
+                        if (!_optimizer.has_baseline_scan(_selected_profile_path)) {
+                            const int choice=select_menu("Create baseline scan?",
+                                {"Scan now", "Continue without scan", "Cancel"});
+                            if (choice<0 || choice==2) {redraw=true; break;}
+                            if (choice==0 && !_optimizer.scan_saved(
+                                    _selected_profile_path)) {
+                                _scan_message="Scan failed: "+_optimizer.saved_error();
+                                redraw=true; break;
+                            }
+                        }
                         _launch_path = _selected_profile_path;
                         _attach_only = false;
                         _current_screen = LAUNCH_GAME;
@@ -1068,6 +1078,15 @@ void Tui::startup_screen()
                         _scan_message = "Recovery required before optimization";
                         redraw = true;
                     } else {
+                        if (!_optimizer.has_baseline_scan()) {
+                            const int choice=select_menu("Create baseline scan?",
+                                {"Scan now", "Continue without scan", "Cancel"});
+                            if (choice<0 || choice==2) {redraw=true; break;}
+                            if (choice==0 && !_optimizer.scan_saved("")) {
+                                _scan_message="Scan failed: "+_optimizer.saved_error();
+                                redraw=true; break;
+                            }
+                        }
                         _launch_path.clear();
                         _attach_only = false;
                         _current_screen = LAUNCH_GAME;
@@ -1101,10 +1120,15 @@ void Tui::startup_screen()
             if (!running)
                 _suppress_auto_attach = false;
             else if (!_suppress_auto_attach) {
-                _launch_path = _selected_profile_path;
-                _attach_only = true;
-                _current_screen = LAUNCH_GAME;
-                return;
+                if (!_optimizer.has_baseline_scan(_selected_profile_path)) {
+                    _scan_message = "Scan PC before the first auto-attach";
+                    redraw = true;
+                } else {
+                    _launch_path = _selected_profile_path;
+                    _attach_only = true;
+                    _current_screen = LAUNCH_GAME;
+                    return;
+                }
             }
             next_scan = now + 2500;
         }
@@ -1269,8 +1293,7 @@ void Tui::launch_current_mode()
         "Game: " + shorten_path(_launch_path, 55), LIGHT_CYAN);
     bottom_border();
 
-    if (_optimizer.scan_saved(_launch_path) &&
-        _optimizer.optimize(_launch_path, !_attach_only)) {
+    if (_optimizer.optimize(_launch_path, !_attach_only)) {
         _closed_apps_summary = _background_apps.close_selected(_launch_path);
         _restore_notice_sent.store(false);
         _current_screen = OPTIMIZATION_MONITOR;

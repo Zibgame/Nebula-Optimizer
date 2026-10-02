@@ -57,46 +57,39 @@ test-preferences:
 	$(CXX) $(CXXFLAGS) tests/test_preferences.cpp src/optimizer/optimizer.cpp src/optimizer/saved_tweaks.cpp \
 		$(LDFLAGS) -o obj/test_preferences.exe
 	obj/test_preferences.exe
-	@sleep 1
-	@rm -f obj/test_preferences.exe
+	@for i in 1 2 3 4 5; do rm -f obj/test_preferences.exe && break; sleep 1; done
 
 test-navigation:
 	$(CXX) $(CXXFLAGS) tests/test_navigation.cpp src/optimizer/optimizer.cpp src/optimizer/saved_tweaks.cpp \
 		$(LDFLAGS) -o obj/test_navigation.exe
 	obj/test_navigation.exe
-	@sleep 1
-	@rm -f obj/test_navigation.exe
+	@for i in 1 2 3 4 5; do rm -f obj/test_navigation.exe && break; sleep 1; done
 
 test-saved-scan:
 	$(CXX) $(CXXFLAGS) tests/test_saved_scan.cpp src/optimizer/saved_tweaks.cpp \
 		$(LDFLAGS) -o obj/test_saved_scan.exe
 	obj/test_saved_scan.exe
-	@sleep 1
-	@rm -f obj/test_saved_scan.exe
+	@for i in 1 2 3 4 5; do rm -f obj/test_saved_scan.exe && break; sleep 1; done
 
 test-tui-view:
 	$(CXX) $(CXXFLAGS) tests/test_tui_view.cpp $(LDFLAGS) -o obj/test_tui_view.exe
 	obj/test_tui_view.exe
-	@sleep 1
-	@rm -f obj/test_tui_view.exe
+	@for i in 1 2 3 4 5; do rm -f obj/test_tui_view.exe && break; sleep 1; done
 
 test-background-apps:
 	$(CXX) $(CXXFLAGS) tests/test_background_apps.cpp src/ui/background_apps.cpp \
 		$(LDFLAGS) -o obj/test_background_apps.exe
 	obj/test_background_apps.exe
-	@sleep 5
-	@rm -f obj/test_background_apps.exe
+	@for i in 1 2 3 4 5; do rm -f obj/test_background_apps.exe && break; sleep 1; done
 
 test-presentmon:
 	$(CXX) $(CXXFLAGS) tests/test_presentmon_metrics.cpp $(LDFLAGS) -o obj/test_presentmon_metrics.exe
 	obj/test_presentmon_metrics.exe
-	@sleep 1
-	@rm -f obj/test_presentmon_metrics.exe
+	@for i in 1 2 3 4 5; do rm -f obj/test_presentmon_metrics.exe && break; sleep 1; done
 
 test-power-qos:
 	$(CXX) $(CXXFLAGS) tests/test_power_qos.cpp $(LDFLAGS) -o obj/test_power_qos.exe
 	obj/test_power_qos.exe
-	@sleep 1
-	@rm -f obj/test_power_qos.exe
+	@for i in 1 2 3 4 5; do rm -f obj/test_power_qos.exe && break; sleep 1; done
 
 .PHONY: all clean fclean re test-preferences test-navigation test-saved-scan test-tui-view test-background-apps test-presentmon test-power-qos
